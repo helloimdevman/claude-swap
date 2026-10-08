@@ -46,6 +46,12 @@ _logger = logging.getLogger("claude-swap")
 
 CODEX_KEYRING_SERVICE = "Codex Auth"
 
+# `codex -c` value forcing the file store whatever the user's config picks
+# (the value is TOML; codex-rs/utils/cli/src/config_override.rs:19-77). For
+# homes cswap creates (temp logins, session profiles), whose login must land
+# in, and be read from, that home's auth.json.
+FILE_STORE_OVERRIDE = 'cli_auth_credentials_store="file"'
+
 # Codex rewrites auth.json IN PLACE (truncate + write, no temp file, no lock;
 # storage.rs:206-223), so a read can land on an empty or half-written file.
 # A short backoff lets that write finish. This rides out an external writer —

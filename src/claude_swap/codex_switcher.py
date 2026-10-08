@@ -31,11 +31,16 @@ import threading
 import time
 from pathlib import Path
 
-from claude_swap import codex_auth, codex_store, oauth, process_detection
-from claude_swap.codex_store import CodexCredentialStore, CodexStoreUnsupported
+from claude_swap import codex_auth, codex_session, codex_store, oauth, process_detection
+from claude_swap.codex_store import (
+    FILE_STORE_OVERRIDE,
+    CodexCredentialStore,
+    CodexStoreUnsupported,
+)
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
+    SessionError,
     SwitchError,
     ValidationError,
 )
@@ -69,10 +74,6 @@ CODEX_ERROR_NOTES = {
         "or fix the file, then retry; `cswap codex unclaimed` inspects it"
     ),
 }
-
-# `codex login -c …`: the login must land in the temp home's auth.json
-# whatever store the user's config would pick.
-_FILE_STORE_OVERRIDE = 'cli_auth_credentials_store="file"'
 
 # A `.login-*` home older than this belongs to a login that died before its
 # cleanup ran (device-code logins time out after 15 minutes; Codex
@@ -197,6 +198,79 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         """Nothing to delete: a Codex session profile keeps its login in its
         own auth.json (file store forced), and the base's entry name lies in
         Claude Code's Keychain namespace."""
+
+    # -- session mode (codex_session) ------------------------------------------
+    #
+    # A Codex profile keeps its login in <profile>/auth.json; its
+    # .credentials.json is Codex's MCP OAuth store and is never touched.
+    # `_session_identity_drifted` needs no override: the base compares
+    # through `_read_session_identity`.
+
+    def make_session_manager(self) -> codex_session.CodexSessionManager:
+        return codex_session.CodexSessionManager(self)
+
+    def _scan_live_sessions(self, session_dir: Path):
+        return codex_session.scan_live_sessions(session_dir)
+
+    def _read_session_credentials(self, session_dir: Path) -> str | None:
+        return codex_session.read_session_credentials(session_dir)
+
+    def _read_session_identity(self, session_dir: Path) -> tuple[str, str] | None:
+        return codex_session.read_session_identity(session_dir)
+
+    def _profile_is_quiescent(self, session_dir: Path) -> bool:
+        return codex_session.profile_is_quiescent(session_dir)
+
+    def _ensure_no_live_session(
+        self, account_num: str, email: str, action: str
+    ) -> None:
+        """The base guard in Codex's words, pointing at Codex's records.
+        (The base names ``<profile>/sessions``, which in a Codex profile is
+        conversation history — not something to "remove or repair".)"""
+        session_dir = self._session_dir(account_num, email)
+        sessions, unreadable = self._scan_live_sessions(session_dir)
+        if sessions:
+            raise SessionError(
+                f"Account-{account_num} ({email}) has a live session-mode Codex "
+                f"process (PID {', '.join(str(s.pid) for s in sessions)}). "
+                f"Exit it first, then retry {action}."
+            )
+        if unreadable:
+            raise SessionError(
+                f"Account-{account_num} ({email}) has {unreadable} session "
+                f"record(s) that could not be read, so whether a Codex process "
+                f"is live cannot be determined. Inspect "
+                f"{session_dir / codex_session.RUN_RECORDS} and "
+                f"{session_dir / 'app-server-daemon'} and remove or repair "
+                f"them, then retry {action}."
+            )
+
+    def _invalidate_session_credentials(self, account_num: str, email: str) -> None:
+        """Drop the profile's login (auth.json) so the next run re-seeds it
+        from the backup; history and everything else stay.
+
+        Only from a quiescent profile. ``_post_backup_write`` decides "live"
+        with ``_live_session_pids``, which drops the records it could not
+        read, so it reaches here for a profile that may be running; that one
+        keeps its login and is marked stale instead (re-seeded once it is
+        quiescent).
+        """
+        from claude_swap.session import clear_session_stale, mark_session_stale
+
+        session_dir = self._session_dir(account_num, email)
+        if not session_dir.exists():
+            return
+        if not self._profile_is_quiescent(session_dir):
+            if not mark_session_stale(session_dir):
+                self._logger.error(
+                    "Account %s's session profile may be in use and could not "
+                    "be marked stale; it may keep the superseded login.",
+                    account_num,
+                )
+            return
+        (session_dir / "auth.json").unlink(missing_ok=True)
+        clear_session_stale(session_dir)
+        self._logger.info(f"Invalidated session credentials for account {account_num}")
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         try:
@@ -500,7 +574,7 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
             cmd = [codex, "login"]
             if device_auth:
                 cmd.append("--device-auth")
-            cmd += ["-c", _FILE_STORE_OVERRIDE]
+            cmd += ["-c", FILE_STORE_OVERRIDE]
             rc = subprocess.run(
                 cmd, env={**os.environ, "CODEX_HOME": str(login_home)}
             ).returncode
@@ -631,9 +705,22 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         refresh_token_reused, and the next switch away writes the stale live
         login back over the fresher backup. So: transient (nothing struck,
         retried next pass) while the live login is unreadable, degraded or in
-        an unsupported store, or carries this slot's lineage. Every consumer
-        (usage collection, autoswitch's freshen, sessions) comes through here.
+        an unsupported store, or carries this slot's lineage — and while the
+        slot's session profile may be in use, since a running session owns
+        the lineage it was seeded with. Every consumer (usage collection,
+        autoswitch's freshen, sessions) comes through here.
         """
+        if not self._profile_is_quiescent(self._session_dir(account_num, email)):
+            # A session may be running on this slot's lineage (the profile is
+            # seeded from the backup). The base gate asks
+            # `_live_session_pids`, which drops records it could not read,
+            # and would then adopt the profile's login and POST its grant
+            # under a running Codex.
+            self._logger.info(
+                "Account %s's session profile may be in use; not consuming "
+                "its refresh token.", account_num,
+            )
+            return oauth.RefreshOutcome(None, "transient")
         try:
             live = self._read_active_credentials()
         except CodexStoreUnsupported:

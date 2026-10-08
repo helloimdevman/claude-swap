@@ -227,6 +227,13 @@ def pid_matches_record(pid: int, proc_start: str | None) -> bool:
     return process_is_claude(pid) is not False
 
 
+def proc_start_stamp(pid: int) -> str | None:
+    """``pid``'s start, stamped the way claude stamps ``procStart`` (and so
+    the way :func:`pid_matches_record` reads it): ``/proc`` clock ticks where
+    that exists (Linux), else ``ps -o lstart``. None when unknowable."""
+    return process_start_ticks(pid) or _ps(pid, "lstart")
+
+
 def scan_sessions(claude_dir: Path | None = None) -> tuple[list[ClaudeSession], int]:
     """Live sessions, and how many records could NOT be read.
 

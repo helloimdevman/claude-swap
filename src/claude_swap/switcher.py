@@ -558,6 +558,14 @@ class ClaudeAccountSwitcher:
         for the list view."""
         return get_running_instances()
 
+    def make_session_manager(self):
+        """The session-mode manager (``cswap run``) for this provider.
+        Resolved at call time, so a patched ``session.SessionManager`` is
+        what gets built."""
+        from claude_swap import session
+
+        return session.SessionManager(self)
+
     def _scan_live_sessions(self, session_dir: Path):
         from claude_swap.session import scan_live_sessions
 
