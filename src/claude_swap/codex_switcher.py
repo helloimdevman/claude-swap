@@ -31,7 +31,7 @@ import threading
 import time
 from pathlib import Path
 
-from claude_swap import codex_auth, codex_store, oauth
+from claude_swap import codex_auth, codex_store, oauth, process_detection
 from claude_swap.codex_store import CodexCredentialStore, CodexStoreUnsupported
 from claude_swap.exceptions import (
     ConfigError,
@@ -46,6 +46,7 @@ from claude_swap.json_output import (
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import get_timestamp
+from claude_swap.paths import CODEX_CLI_PREFIX, CODEX_DISPLAY_NAME, CODEX_SUBDIR
 from claude_swap.printer import bolded, dimmed, warning
 from claude_swap.switcher import ERROR_NOTES, SENTINEL_NOTES, ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
@@ -118,9 +119,9 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
     """Multi-account switcher for OpenAI Codex CLI logins."""
 
     provider_name = "codex"
-    display_name = "Codex"
-    cli_prefix = "cswap codex"
-    backup_subdir = "codex"
+    display_name = CODEX_DISPLAY_NAME
+    cli_prefix = CODEX_CLI_PREFIX
+    backup_subdir = CODEX_SUBDIR
     backup_keychain_service = "claude-swap-codex"
     run_legacy_migrations = False
     sentinel_notes = CODEX_SENTINEL_NOTES
@@ -169,9 +170,10 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         return bool(creds) and codex_auth.is_api_key_blob(creds)
 
     def _running_instances(self):
-        # ponytail: no Codex process scan yet — reports none rather than
-        # Claude's; a ps scan for `codex` executables replaces this.
-        return [], []
+        """Running Codex processes, in the base's ``(sessions, ides)`` shape:
+        Codex keeps no session or IDE lock files, so all of them are found by
+        one ``ps`` scan and listed as sessions."""
+        return process_detection.list_codex_processes(), []
 
     def _refuse_session_shell(self) -> None:
         """Refuse account mutation from inside a ``cswap codex run`` shell:
@@ -190,6 +192,11 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
             "on the wrong live store — unset CODEX_HOME or run from a normal "
             "shell."
         )
+
+    def _delete_session_keychain_entry(self, session_dir: Path) -> None:
+        """Nothing to delete: a Codex session profile keeps its login in its
+        own auth.json (file store forced), and the base's entry name lies in
+        Claude Code's Keychain namespace."""
 
     def _slot_token_dead(self, num: str, email: str) -> bool:
         try:

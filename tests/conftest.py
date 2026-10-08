@@ -630,6 +630,17 @@ def block_real_codex_network(request, monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_codex_process_scan(monkeypatch):
+    """No test may read the machine's process table: the Codex switcher's
+    running-process scan (``cswap codex list``, the switch follow-up) is a
+    ``ps`` listing, so it answers "none running". Tests of the scan itself
+    keep a reference to the real ``list_codex_processes`` taken at import
+    and fake ``subprocess.run`` beneath it."""
+    monkeypatch.setattr("claude_swap.process_detection.list_codex_processes", lambda: [])
+    yield
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

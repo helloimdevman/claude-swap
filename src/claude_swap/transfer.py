@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shlex
 import sys
 import tempfile
 from pathlib import Path
@@ -45,6 +46,44 @@ _PLATFORM_TAG = {
 def _eprint(msg: str) -> None:
     """Print to stderr so stdout stays pure JSON in pipe mode."""
     print(msg, file=sys.stderr)
+
+
+def _refuse_other_provider(
+    switcher: ClaudeAccountSwitcher, document: dict, source: str, command: str
+) -> None:
+    """Refuse a document another provider's switcher wrote.
+
+    Documents name their provider: a Codex export or ``cswap codex list
+    --json`` carries ``"provider": "codex"``; a Claude one has no such field
+    (it predates providers, and its bytes stay as they were). A Claude slot
+    holding a Codex login (or the reverse) is unusable and its switch would
+    write it into the wrong live store, so each side takes only its own
+    documents and names the command that takes the other's.
+    """
+    from claude_swap.codex_switcher import CodexAccountSwitcher
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    provider = document.get("provider", "claude")
+    if provider is not None and not isinstance(provider, str):
+        raise TransferError(
+            f"provider must be a string, got {type(provider).__name__}"
+        )
+    if provider == switcher.provider_name:
+        return
+    kind = "usage document lists" if command == "import-usage" else "export holds"
+    other = {
+        cls.provider_name: cls for cls in (ClaudeAccountSwitcher, CodexAccountSwitcher)
+    }.get(provider)
+    if other is None:
+        raise TransferError(
+            f"This {kind} accounts of provider {provider!r}, which this version "
+            "of cswap does not support."
+        )
+    raise TransferError(
+        f"This {kind} {other.display_name} accounts; '{switcher.cli_prefix} "
+        f"{command}' takes {switcher.display_name} ones. Import it with: "
+        f"{other.cli_prefix} {command} {shlex.quote(source)}"
+    )
 
 
 def _parse_payload(text: str, label: str) -> dict:
@@ -186,7 +225,9 @@ def export_accounts(
     """
     sequence_data = switcher._get_sequence_data_migrated()
     if not sequence_data or not sequence_data.get("accounts"):
-        raise TransferError("no accounts to export — run cswap --add-account first")
+        raise TransferError(
+            f"no accounts to export — run {switcher.cli_prefix} --add-account first"
+        )
 
     accounts_map = sequence_data["accounts"]
 
@@ -224,10 +265,9 @@ def export_accounts(
                 raise CredentialReadError(
                     f"failed to read live credentials for active account {email}"
                 )
-            config_path = switcher._get_claude_config_path()
-            if not config_path.exists():
+            config_text = switcher._snapshot_live_config()
+            if config_text is None:
                 raise ConfigError("Claude config file not found")
-            config_text = config_path.read_text(encoding="utf-8")
         else:
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
@@ -243,7 +283,7 @@ def export_accounts(
                 _eprint(
                     f"Skipping Account-{num} ({email}): no stored "
                     f"credentials/config — re-add with: "
-                    f"cswap --add-account --slot {num}"
+                    f"{switcher.cli_prefix} --add-account --slot {num}"
                 )
                 continue
 
@@ -280,7 +320,8 @@ def export_accounts(
     if not accounts_payload:
         raise TransferError(
             "no exportable accounts — all managed slots are missing stored "
-            "credentials/config. Re-add with: cswap --add-account --slot <number>"
+            f"credentials/config. Re-add with: {switcher.cli_prefix} --add-account "
+            "--slot <number>"
         )
 
     # Only carry activeAccountNumber if that slot is actually present in the
@@ -301,6 +342,8 @@ def export_accounts(
         "activeAccountNumber": active_in_payload,
         "accounts": accounts_payload,
     }
+    if switcher.provider_name != "claude":
+        envelope["provider"] = switcher.provider_name
 
     serialized = json.dumps(envelope, indent=2)
 
@@ -358,8 +401,10 @@ def import_accounts(
     if envelope.get("encrypted") is True:
         raise TransferError(
             "encrypted exports are not supported in this version — "
-            "decrypt before piping (e.g. gpg -d backup.gpg | cswap --import -)"
+            f"decrypt before piping (e.g. gpg -d backup.gpg | "
+            f"{switcher.cli_prefix} --import -)"
         )
+    _refuse_other_provider(switcher, envelope, source, "import")
 
     accounts = envelope.get("accounts")
     if not isinstance(accounts, list) or not accounts:
@@ -643,7 +688,8 @@ def import_accounts(
         if live_slot is not None and live_slot in written_slots:
             _eprint(
                 f"Note: {identity[0]} is your current live login — activate the "
-                f"imported credentials with: cswap --switch-to {live_slot} --force"
+                f"imported credentials with: "
+                f"{switcher.cli_prefix} --switch-to {live_slot} --force"
             )
 
 
@@ -689,8 +735,10 @@ def import_usage(
     if version != JSON_SCHEMA_VERSION:
         raise TransferError(
             f"unsupported usage document schemaVersion: {version!r} "
-            f"(expected {JSON_SCHEMA_VERSION}, as printed by 'cswap list --json')"
+            f"(expected {JSON_SCHEMA_VERSION}, as printed by "
+            f"'{switcher.cli_prefix} list --json')"
         )
+    _refuse_other_provider(switcher, document, source, "import-usage")
     rows = document.get("accounts")
     if not isinstance(rows, list):
         raise TransferError("usage document has no accounts list")

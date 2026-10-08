@@ -76,6 +76,9 @@ from claude_swap.printer import (
     warning,
 )
 from claude_swap.paths import (
+    CODEX_CLI_PREFIX,
+    CODEX_DISPLAY_NAME,
+    CODEX_SUBDIR,
     get_backup_root,
     get_credentials_path,
     get_default_claude_config_home,
@@ -585,6 +588,13 @@ class ClaudeAccountSwitcher:
         from claude_swap.session import profile_is_quiescent
 
         return profile_is_quiescent(session_dir)
+
+    def _delete_session_keychain_entry(self, session_dir: Path) -> None:
+        """Drop a session profile's own Keychain entry (best effort; the
+        name derives from the dir, so callers run this before deleting it)."""
+        from claude_swap.session import delete_macos_keychain_entry
+
+        delete_macos_keychain_entry(session_dir)
 
     def live_login_path(self) -> Path:
         """The file whose mtime moves when the live login changes (menubar
@@ -2958,15 +2968,12 @@ class ClaudeAccountSwitcher:
         projects/history survive. Used when backup credentials change under
         an existing profile (e.g. --import --force).
         """
-        from claude_swap.session import (
-            clear_session_stale,
-            delete_macos_keychain_entry,
-        )
+        from claude_swap.session import clear_session_stale
 
         session_dir = self._session_dir(account_num, email)
         if not session_dir.exists():
             return
-        delete_macos_keychain_entry(session_dir)
+        self._delete_session_keychain_entry(session_dir)
         (session_dir / ".credentials.json").unlink(missing_ok=True)
         clear_session_stale(session_dir)
         self._logger.info(
@@ -3068,14 +3075,11 @@ class ClaudeAccountSwitcher:
         it: clear it explicitly, or the next profile created for this same
         slot+email inherits a re-bootstrap flag nothing set for it.
         """
-        from claude_swap.session import (
-            clear_session_stale,
-            delete_macos_keychain_entry,
-        )
+        from claude_swap.session import clear_session_stale
 
         session_dir = self._session_dir(account_num, email)
         if session_dir.exists():
-            delete_macos_keychain_entry(session_dir)
+            self._delete_session_keychain_entry(session_dir)
             shutil.rmtree(session_dir, ignore_errors=True)
         # NOT under that `if`. The marker lives OUTSIDE the dir, so it
         # outlives it: `purge` removes profile dirs (`iterdir()` + `is_dir()`)
@@ -7430,13 +7434,22 @@ class ClaudeAccountSwitcher:
         - The active backup directory (XDG path on Linux/WSL, ~/.claude-swap-backup elsewhere)
         - Any stale legacy ~/.claude-swap-backup directory left around from
           before the XDG migration
+
+        Per provider: the root's own provider (Claude) leaves Codex's store,
+        ``<root>/codex``, and so the root itself, in place. A provider whose
+        store is a subdir of the root (Codex) removes that subdir only.
         """
         self._refuse_session_shell()
+        # A subdir store is all such a purge owns: never the shared root, nor
+        # the pre-XDG legacy dir or the old keyring entries, which are
+        # Claude's (no other provider predates the XDG move).
+        scoped = bool(self.backup_subdir)
+        codex_dir = self.root_dir / CODEX_SUBDIR
         legacy = get_legacy_backup_root()
         # Against the ROOT, not backup_dir: on macOS/Windows the legacy path
         # IS the root, and a provider subdir would otherwise read it as a
         # stale legacy dir and rmtree the whole shared root.
-        legacy_distinct = legacy != self.root_dir
+        legacy_distinct = not scoped and legacy != self.root_dir
 
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
@@ -7474,8 +7487,14 @@ class ClaudeAccountSwitcher:
                 "them, then retry --purge."
             )
 
-        warning("This will remove ALL claude-swap data from your system:")
+        scope = f" {self.display_name}" if scoped else ""
+        warning(f"This will remove ALL claude-swap{scope} data from your system:")
         print(f"  - Backup directory: {self.backup_dir}")
+        if not scoped and os.path.lexists(codex_dir):
+            print(dimmed(
+                f"    (keeps {codex_dir}, the {CODEX_DISPLAY_NAME} accounts; "
+                f"remove those with: {CODEX_CLI_PREFIX} purge)"
+            ))
         if legacy_distinct and legacy.exists():
             print(f"  - Legacy backup directory: {legacy}")
         if self.platform == Platform.MACOS:
@@ -7485,7 +7504,9 @@ class ClaudeAccountSwitcher:
         if session_dirs:
             print("  - All session profiles and their Keychain entries")
         print()
-        print(dimmed("Note: This does NOT affect your current Claude Code login."))
+        print(dimmed(
+            f"Note: This does NOT affect your current {self.display_name} login."
+        ))
         print()
 
         confirm = input("Are you sure you want to purge all data? [y/N] ")
@@ -7527,21 +7548,25 @@ class ClaudeAccountSwitcher:
                         except Exception:
                             pass  # Ignore errors during purge
 
+                if scoped:
+                    # The provider's own Keychain service holds nothing else,
+                    # so its retained `.prev` generations go too. (Claude's
+                    # purge has never removed its own; unchanged.)
+                    self._store.delete_previous_backup(account_num, email)
+
                 # Best-effort sweep of any pre-migration keyring / Credential
                 # Manager entries left behind by an incomplete keyring → files
                 # (Windows) or keyring → security (macOS) migration. Linux/WSL
                 # never used a keyring backend.
-                if self.platform in (Platform.MACOS, Platform.WINDOWS):
+                if not scoped and self.platform in (Platform.MACOS, Platform.WINDOWS):
                     _sweep_legacy_keyring(usernames, removed_items)
 
         # Session-profile keychain entries must go BEFORE the backup dir:
         # the hashed service names are derived from the dir paths and can't
         # be recomputed once the directories are deleted.
         if session_dirs:
-            from claude_swap.session import delete_macos_keychain_entry
-
             for d in session_dirs:
-                delete_macos_keychain_entry(d)
+                self._delete_session_keychain_entry(d)
             removed_items.append(
                 f"Session profiles: {', '.join(d.name for d in session_dirs)}"
             )
@@ -7553,8 +7578,24 @@ class ClaudeAccountSwitcher:
                 handler.close()
                 self._logger.removeHandler(handler)
 
-            shutil.rmtree(self.backup_dir)
-            removed_items.append(f"Directory: {self.backup_dir}")
+            root_is_link = self.backup_dir.is_symlink() or self.backup_dir.is_junction()
+            if scoped or root_is_link or not os.path.lexists(codex_dir):
+                # Exactly the old removal (which refuses a linked root).
+                shutil.rmtree(self.backup_dir)
+                removed_items.append(f"Directory: {self.backup_dir}")
+            else:
+                # Everything but Codex's store, which keeps the root too. A
+                # link is removed, never followed out of the root.
+                for child in self.backup_dir.iterdir():
+                    if child == codex_dir:
+                        continue
+                    if child.is_dir() and not (child.is_symlink() or child.is_junction()):
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                removed_items.append(
+                    f"Directory: {self.backup_dir} (kept {codex_dir.name}/)"
+                )
 
         # Also clean a stale legacy directory if it somehow still exists
         # (e.g. a partial pre-migration state, or files re-created after init).
