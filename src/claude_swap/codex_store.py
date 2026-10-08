@@ -37,7 +37,7 @@ import tomllib
 from pathlib import Path
 
 from claude_swap import codex_auth, macos_keychain
-from claude_swap.credentials import ActiveCredentials, CredentialStore
+from claude_swap.credentials import ActiveCredentials, CredentialStore, _StoreHost
 from claude_swap.exceptions import ClaudeSwitchError, CredentialWriteError
 from claude_swap.fsutil import replace_with_retry
 from claude_swap.models import Platform
@@ -103,6 +103,13 @@ def credential_store_mode(config: dict | None = None) -> str:
     return str(config.get("cli_auth_credentials_store", "file"))
 
 
+def chatgpt_base_url() -> str | None:
+    """``chatgpt_base_url`` from Codex's config; None means Codex's default
+    backend (codex-rs/core/src/config/mod.rs:4420-4422)."""
+    value = read_codex_config().get("chatgpt_base_url")
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def keyring_account_name(home: Path) -> str:
     """Codex's keyring account for ``home`` (storage.rs:235-249): ``"cli|"`` +
     the first 16 hex of sha256 over the canonical path (the path as spelled
@@ -141,7 +148,19 @@ class CodexCredentialStore(CredentialStore):
       shared cache would add nothing but cross-talk: a later success on the
       Codex item would erase a failure ``_kc_call`` recorded for a backup
       read (the erasure ``_active_read_failed`` exists to prevent).
+
+    The last write's user-facing warnings (a Keychain fallback, a leftover
+    auth.json, the account_id mismatch) are kept in ``write_warnings`` as well
+    as logged, so the switch can show them instead of burying them in the log.
     """
+
+    def __init__(self, host: _StoreHost) -> None:
+        super().__init__(host)
+        self.write_warnings: list[str] = []
+
+    def _warn(self, message: str) -> None:
+        self._host._logger.warning(message)
+        self.write_warnings.append(message)
 
     # -- mode -------------------------------------------------------------------
 
@@ -278,6 +297,7 @@ class CodexCredentialStore(CredentialStore):
                 cannot switch.
             CredentialWriteError: The write failed; the live store is unchanged.
         """
+        self.write_warnings = []
         mode = self._resolve_mode()
         home = codex_home()
         if os.environ.get("CODEX_HOME") and not home.is_dir():
@@ -331,9 +351,7 @@ class CodexCredentialStore(CredentialStore):
                     f"not be cleared ({e2}); refusing to switch via auth.json while "
                     "that item would shadow it. Unlock the Keychain and retry."
                 )
-            self._host._logger.warning(
-                f"Codex Keychain write failed, falling back to auth.json: {e}"
-            )
+            self._warn(f"Codex Keychain write failed, falling back to auth.json: {e}")
             # ponytail: if this file write then fails, the item is already
             # gone and the previous login survives only in its slot backup;
             # restoring it would need the old item value read first.
@@ -344,9 +362,7 @@ class CodexCredentialStore(CredentialStore):
         try:
             live_auth_path().unlink(missing_ok=True)
         except OSError as e:
-            self._host._logger.warning(
-                f"Could not remove {live_auth_path()} after Keychain write: {e}"
-            )
+            self._warn(f"Could not remove {live_auth_path()} after Keychain write: {e}")
         return "keychain"
 
     def _write_auth_file(self, credentials: str) -> None:
@@ -401,7 +417,7 @@ class CodexCredentialStore(CredentialStore):
             self._host._logger.debug(f"Skipped post-write Codex verification: {e}")
             return
         if stored and claimed and stored != claimed:
-            self._host._logger.warning(
+            self._warn(
                 f"Live Codex login is inconsistent after writing it: tokens.account_id "
                 f"{stored!r} but the id_token belongs to {claimed!r} — a running Codex "
                 "probably refreshed concurrently. Quit Codex and switch again."

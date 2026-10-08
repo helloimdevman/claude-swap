@@ -413,7 +413,12 @@ def _request_usage_result(credentials: str, access_token: str) -> dict | None:
     ``request_usage_data``, so the caller's classification (401 refresh,
     Retry-After, error kinds) applies to both."""
     if codex_auth.parse_blob(credentials) is not None:
-        return codex_auth.build_usage_result(codex_auth.request_usage(credentials))
+        # Lazy: codex_store -> credentials -> models -> usage_store -> oauth.
+        from claude_swap.codex_store import chatgpt_base_url
+
+        return codex_auth.build_usage_result(
+            codex_auth.request_usage(credentials, base_url=chatgpt_base_url())
+        )
     return build_usage_result(request_usage_data(access_token))
 
 

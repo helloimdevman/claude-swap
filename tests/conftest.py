@@ -649,6 +649,45 @@ def temp_home(tmp_path: Path):
 
 
 @pytest.fixture
+def codex_home(temp_home: Path, monkeypatch: pytest.MonkeyPatch):
+    """``~/.codex`` under ``temp_home`` holding a live personal ChatGPT login.
+
+    ``auth.json`` is ``codex_fixtures.auth_json()`` (user@example.com,
+    account ``acct-personal``, plan ``plus``); rewrite it to vary the live
+    login. ``CODEX_HOME`` stays unset, so Codex's default home is used.
+
+    Every switcher built re-points the shared ``claude-swap`` logger, and
+    ``setup_logging`` drops the previous file handler without closing it;
+    close each one as it is replaced and at teardown, so these tests leave no
+    unclosed-log ResourceWarnings behind (as ``test_logging_config`` does).
+    """
+    import logging
+
+    from claude_swap import switcher as switcher_module
+    from tests import codex_fixtures
+
+    logger = logging.getLogger("claude-swap")
+
+    def close_handlers() -> None:
+        for handler in logger.handlers[:]:
+            handler.close()
+            logger.removeHandler(handler)
+
+    real_setup_logging = switcher_module.setup_logging
+
+    def setup_logging(*args, **kwargs):
+        close_handlers()
+        return real_setup_logging(*args, **kwargs)
+
+    monkeypatch.setattr(switcher_module, "setup_logging", setup_logging)
+    home = temp_home / ".codex"
+    home.mkdir()
+    (home / "auth.json").write_text(codex_fixtures.auth_json(), encoding="utf-8")
+    yield home
+    close_handlers()
+
+
+@pytest.fixture
 def mock_claude_config(temp_home: Path):
     """Create a mock Claude configuration file."""
     config = {
