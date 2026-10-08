@@ -118,7 +118,7 @@ def make_api_key_blob(key: str) -> str:
     return json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": key})
 
 
-def _chatgpt_tokens(creds: str) -> dict | None:
+def chatgpt_tokens(creds: str) -> dict | None:
     """``tokens`` of a ChatGPT-mode blob; None for API-key or broken blobs."""
     data = parse_blob(creds)
     if data is None or _is_api_key(data):
@@ -127,13 +127,13 @@ def _chatgpt_tokens(creds: str) -> dict | None:
     return tokens if isinstance(tokens, dict) else None
 
 
-def _account_id(tokens: dict, auth_claims: dict) -> str | None:
+def _account_id(tokens: dict, auth: dict) -> str | None:
     # The stored account_id is what Codex itself keys refresh/reload on
     # (auth/manager.rs:614-626); the claim covers blobs written without it.
-    return _str(tokens.get("account_id")) or _str(auth_claims.get("chatgpt_account_id"))
+    return _str(tokens.get("account_id")) or _str(auth.get("chatgpt_account_id"))
 
 
-def _auth_claims(claims: dict | None) -> dict:
+def auth_claims(claims: dict | None) -> dict:
     auth = (claims or {}).get(_AUTH_CLAIM)
     return auth if isinstance(auth, dict) else {}
 
@@ -145,11 +145,11 @@ def identity(creds: str) -> dict | None:
     ``organizationUuid`` is the ChatGPT account (workspace) id, so a personal
     account and a workspace membership of the same email stay distinct.
     """
-    tokens = _chatgpt_tokens(creds)
+    tokens = chatgpt_tokens(creds)
     claims = decode_jwt_payload(tokens.get("id_token")) if tokens else None
     if claims is None:
         return None
-    auth = _auth_claims(claims)
+    auth = auth_claims(claims)
     profile = claims.get(_PROFILE_CLAIM)
     profile_email = profile.get("email") if isinstance(profile, dict) else None
     return {
@@ -165,7 +165,7 @@ def oauth_view(creds: str) -> dict | None:
     Codex blobs: ``{"accessToken", "refreshToken", "expiresAt", "idToken",
     "accountId"}``. ``expiresAt`` is epoch ms from the access token's
     ``exp`` (None when undecodable — "unknown", never "expired")."""
-    tokens = _chatgpt_tokens(creds)
+    tokens = chatgpt_tokens(creds)
     if tokens is None:
         return None
     access = _str(tokens.get("access_token"))
@@ -178,7 +178,7 @@ def oauth_view(creds: str) -> dict | None:
         "refreshToken": _str(tokens.get("refresh_token")),
         "expiresAt": int(exp * 1000) if exp is not None else None,
         "idToken": id_token,
-        "accountId": _account_id(tokens, _auth_claims(decode_jwt_payload(id_token))),
+        "accountId": _account_id(tokens, auth_claims(decode_jwt_payload(id_token))),
     }
 
 
@@ -271,7 +271,7 @@ def try_refresh(creds: str, timeout_s: float = 10.0) -> RefreshOutcome:
     # reload compares). A blob lacking it gets it from the id_token claim,
     # as Codex's login does: Codex's guarded refresh fails without one.
     if not _str(tokens.get("account_id")):
-        claim = _auth_claims(decode_jwt_payload(tokens.get("id_token"))).get("chatgpt_account_id")
+        claim = auth_claims(decode_jwt_payload(tokens.get("id_token"))).get("chatgpt_account_id")
         if _str(claim):
             tokens["account_id"] = claim
     data["last_refresh"] = now_rfc3339()
