@@ -50,6 +50,29 @@ class RealStoreWriteBlocked(Exception):
     """
 
 
+_CONFTEST_PATH = Path(__file__).resolve()
+
+
+def _codex_home_specs() -> tuple[tuple[Path, bool], ...]:
+    """``~/.codex`` and an exported ``$CODEX_HOME``, recursively protected.
+
+    Except when this very checkout lives under one: Codex keeps its own git
+    worktrees in ``$CODEX_HOME/worktrees/``, and a recursive root there
+    would refuse the suite's own ``__pycache__``/``.pytest_cache`` writes —
+    the reason ``~/.claude`` is non-recursive. Such a root keeps its direct
+    children (``auth.json``, ``config.toml``) protected.
+    """
+    roots = [Path.home() / ".codex"]
+    if raw := os.environ.get("CODEX_HOME"):
+        # Absolute as spelled (what cswap joins paths onto) AND resolved
+        # (what Codex canonicalizes it to): the hook compares spellings, and
+        # a relative value would match no absolute candidate at all.
+        roots += [Path(os.path.abspath(raw)), Path(raw).resolve()]
+    return tuple(
+        (root, not _CONFTEST_PATH.is_relative_to(root.resolve())) for root in roots
+    )
+
+
 def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
     """Snapshot the REAL (non-test) account-store roots EXACTLY ONCE, here,
     at conftest import time — before any fixture has ever touched
@@ -144,6 +167,9 @@ def _freeze_real_store_specs() -> tuple[tuple[Path, bool], ...]:
             # directory exists, so not one mkdir is attempted above them.
             (_paths.get_default_claude_config_home() / "projects", True),
             (_paths.get_claude_config_home() / "projects", True),
+            # Codex's live login (`auth.json`, `config.toml`) and everything
+            # else under its home is the user's, never cswap's to touch.
+            *_codex_home_specs(),
         )
 
     ambient_specs = _resolve()
@@ -515,6 +541,8 @@ def _isolate_real_home(request, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("CLAUDE_SECURESTORAGE_CONFIG_DIR", raising=False)
     monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    # Same bypass for Codex: CODEX_HOME points straight at a live login.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     if "temp_home" in request.fixturenames:
         return  # temp_home provides its own isolated home
     if "tmp_keychain" in request.fixturenames:
@@ -570,6 +598,35 @@ def block_real_oauth_profile_fetch(request, monkeypatch):
         yield
         return
     monkeypatch.setattr("claude_swap.oauth.fetch_oauth_profile", lambda token: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def block_real_codex_network(request, monkeypatch):
+    """Safety net: no test may reach chatgpt.com / auth.openai.com.
+
+    The workspace-name lookup is advisory, so it answers None (its documented
+    failure value). Usage and refresh have no such neutral answer — a silent
+    stub would let a test pass on fake data it never asked for — so they
+    raise ``AssertionError("real Codex network call in test")``. Called
+    directly, or through ``oauth.try_refresh_oauth_credentials``, that
+    propagates. Through ``oauth.try_fetch_usage_for_account`` it does NOT:
+    that function's catch-all turns it into ``UsageOutcome(usage=None,
+    error="AssertionError")``, so a test there must assert on that error
+    kind to notice. Tests that patch these explicitly override this;
+    ``@pytest.mark.no_codex_network_fake`` opts out for tests that exercise
+    the functions themselves against a mocked ``urlopen``.
+    """
+    if request.node.get_closest_marker("no_codex_network_fake"):
+        yield
+        return
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("real Codex network call in test")
+
+    monkeypatch.setattr("claude_swap.codex_auth.fetch_workspace_name", lambda *a, **k: None)
+    monkeypatch.setattr("claude_swap.codex_auth.request_usage", refuse)
+    monkeypatch.setattr("claude_swap.codex_auth.try_refresh", refuse)
     yield
 
 

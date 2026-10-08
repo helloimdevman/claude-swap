@@ -69,4 +69,5 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "no_keychain_fake: opt out of the autouse in-memory Keychain guard (test mocks subprocess itself, or runs against a temp keychain on GitHub Actions)",
     "no_oauth_profile_fake: opt out of the autouse fetch_oauth_profile stub (test exercises fetch_oauth_profile itself against a mocked urlopen)",
+    "no_codex_network_fake: opt out of the autouse Codex network stub (test exercises codex_auth's request_usage/try_refresh/fetch_workspace_name against a mocked urlopen)",
 ]
