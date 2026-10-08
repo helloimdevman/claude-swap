@@ -222,7 +222,11 @@ def last_seen_note(entry: UsageEntry) -> str | None:
     )
 
 
-def _usage_entry_lines(entry: UsageEntry) -> list[str]:
+def _usage_entry_lines(
+    entry: UsageEntry,
+    sentinel_notes: dict[str, str] = SENTINEL_NOTES,
+    error_notes: dict[str, str] = ERROR_NOTES,
+) -> list[str]:
     """Styled usage lines (sans indent) for one account's entry.
 
     Sentinel states render their note first, with a supplementary "last seen"
@@ -232,7 +236,7 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
     error, so a failing endpoint is visible instead of a silent blank.
     """
     if entry.sentinel is not None:
-        out = [dimmed(SENTINEL_NOTES.get(entry.sentinel, entry.sentinel))]
+        out = [dimmed(sentinel_notes.get(entry.sentinel, entry.sentinel))]
         last_seen = last_seen_note(entry)
         if last_seen is not None and entry.sentinel != USAGE_API_KEY:
             out.append(f"{dimmed('└')} {muted(last_seen)}")
@@ -252,7 +256,7 @@ def _usage_entry_lines(entry: UsageEntry) -> list[str]:
         ]
     detail = "usage unavailable"
     if entry.last_error:
-        detail += f" ({ERROR_NOTES.get(entry.last_error, entry.last_error)})"
+        detail += f" ({error_notes.get(entry.last_error, entry.last_error)})"
     return [dimmed(detail)]
 
 
@@ -530,6 +534,15 @@ class ClaudeAccountSwitcher:
                 "organizationName": None,
             }
         }
+
+    def _looks_like_api_key(self, creds: str | None) -> bool:
+        """Whether a stored credential is this provider's API-key kind (no
+        OAuth lineage, no subscription quota)."""
+        return looks_like_api_key(creds)
+
+    def _live_credentials_path(self) -> Path:
+        """The live credential file; its mtime is stash diagnostics only."""
+        return get_credentials_path()
 
     def _store_env_guard(self) -> bool:
         """True when the live store is redirected away from the default one
@@ -2880,7 +2893,7 @@ class ClaudeAccountSwitcher:
     ) -> list[str]:
         """Source-labelled token-status lines for one account's display row."""
         num, email, _org_name, org_uuid, is_active, creds, _alias = account_info
-        if looks_like_api_key(creds):
+        if self._looks_like_api_key(creds):
             return []
         if is_active:
             line = _label_token_status("active profile", creds)
@@ -3482,7 +3495,7 @@ class ClaudeAccountSwitcher:
         account, corrupting the session-guard / export / collision logic that keys
         off ``kind``. Reject with guidance toward the supported path instead.
         """
-        if looks_like_api_key(creds):
+        if self._looks_like_api_key(creds):
             raise ValidationError(
                 "Active login is an API-key account. Add it with "
                 "'cswap --add-token sk-ant-api...' instead of --add-account."
@@ -3953,7 +3966,7 @@ class ClaudeAccountSwitcher:
         if not token:
             raise ValidationError("Token cannot be empty")
 
-        is_api_key = looks_like_api_key(token)
+        is_api_key = self._looks_like_api_key(token)
 
         if email and not self._validate_email(email):
             raise ValidationError(f"Invalid email format: {email}")
@@ -4948,7 +4961,7 @@ class ClaudeAccountSwitcher:
         outlive the condition that produced it.
         """
         num, email, _, _, is_active, creds, _alias = account_info
-        if looks_like_api_key(creds):
+        if self._looks_like_api_key(creds):
             # Managed API-key account: no subscription quota to fetch.
             return USAGE_API_KEY
         if not creds or not oauth.extract_access_token(creds):
@@ -5735,7 +5748,9 @@ class ClaudeAccountSwitcher:
             if self._disabled_from_data(seq_data, str(num)):
                 markers += f" {muted('(disabled)')}"
             print(f"  {num}: {label} {muted(f'[{tag}]')}{markers}")
-            for line in _usage_entry_lines(entries[str(num)]):
+            for line in _usage_entry_lines(
+                entries[str(num)], self.sentinel_notes, self.error_notes
+            ):
                 print(f"     {line}")
 
             if show_token_status:
@@ -5898,7 +5913,9 @@ class ClaudeAccountSwitcher:
             entry = self._active_account_usage(
                 account_num, current_email, current_org_uuid
             )
-            for line in _usage_entry_lines(entry):
+            for line in _usage_entry_lines(
+                entry, self.sentinel_notes, self.error_notes
+            ):
                 print(f"  {line}")
         else:
             print(f"{bolded('Status:')} {current_email} {dimmed('(not managed)')}")
@@ -6761,7 +6778,7 @@ class ClaudeAccountSwitcher:
         """
         creds_mtime: str | None = None
         try:
-            mtime = get_credentials_path().stat().st_mtime
+            mtime = self._live_credentials_path().stat().st_mtime
             from datetime import datetime, timezone
 
             creds_mtime = datetime.fromtimestamp(

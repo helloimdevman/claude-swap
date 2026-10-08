@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from claude_swap import __version__
-from claude_swap.credentials import looks_like_api_key
 from claude_swap.exceptions import (
     ConfigError,
     CredentialReadError,
@@ -255,7 +254,7 @@ def export_accounts(
         # API-key accounts store the credential as a raw ``sk-ant-api…`` string,
         # not OAuth JSON — carry it verbatim (and tag the kind) so the JSON parse
         # below doesn't choke and import can restore it as-is.
-        is_api_key = looks_like_api_key(creds_text)
+        is_api_key = switcher._looks_like_api_key(creds_text)
         if is_api_key:
             creds_payload: Any = creds_text.strip()
         else:
@@ -390,7 +389,7 @@ def import_accounts(
         # carry a JSON object.
         is_api_key = raw.get("kind") == "api_key" or isinstance(creds_obj, str)
         if is_api_key:
-            if not (isinstance(creds_obj, str) and looks_like_api_key(creds_obj)):
+            if not (isinstance(creds_obj, str) and switcher._looks_like_api_key(creds_obj)):
                 raise TransferError(
                     f"API-key credentials for {email} must be a raw sk-ant-api… string"
                 )
