@@ -307,20 +307,46 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
 class ClaudeAccountSwitcher:
     """Multi-account switcher for Claude Code."""
 
+    # Provider identity. A provider subclass (Codex) overrides these and the
+    # hook methods below; everything else -- the roster, the switch
+    # transaction, usage collection -- is shared orchestration.
+    provider_name = "claude"
+    display_name = "Claude Code"
+    cli_prefix = "cswap"
+    # Child of the backup root holding this provider's store. "" = the root
+    # itself, so Claude's on-disk layout is unchanged.
+    backup_subdir = ""
+    # macOS Keychain service for per-account BACKUP items, read by
+    # CredentialStore through its host view and by purge. Per provider, or a
+    # Claude slot 1 and another provider's slot 1 for the same email would
+    # overwrite each other (same `account-{num}-{email}` account name).
+    backup_keychain_service = SECURITY_SERVICE
+    # One-time data migrations sweep Claude's historical keyring/file names;
+    # a provider with no legacy data must not run them against its store.
+    run_legacy_migrations = True
+    sentinel_notes = SENTINEL_NOTES
+    error_notes = ERROR_NOTES
+
     def __init__(self, debug: bool = False):
         self.home = Path.home()
         self.platform = Platform.detect()
-        self.backup_dir = get_backup_root()
+        self.root_dir = get_backup_root()
+        self.backup_dir = (
+            self.root_dir / self.backup_subdir if self.backup_subdir else self.root_dir
+        )
 
         # Migrate legacy ~/.claude-swap-backup to the new XDG path on Linux/WSL
         # before any logger or directory setup writes to the new location.
-        # Migration is a no-op on macOS/Windows where backup_dir already
+        # Migration is a no-op on macOS/Windows where the root already
         # equals the legacy path. MigrationError on a genuine collision
         # propagates as a ClaudeSwitchError and is caught by the CLI.
-        if migrate_legacy_backup_dir(self.backup_dir):
+        # Always the ROOT, never a provider subdir: with `<root>/codex` the
+        # target would not exist yet and the legacy store would be
+        # `shutil.move`d into its own child.
+        if migrate_legacy_backup_dir(self.root_dir):
             legacy = get_legacy_backup_root()
             print(
-                f"claude-swap: migrated data from {legacy} to {self.backup_dir}",
+                f"claude-swap: migrated data from {legacy} to {self.root_dir}",
                 file=sys.stderr,
             )
 
@@ -336,10 +362,11 @@ class ClaudeAccountSwitcher:
 
         # The credential storage layer (active + per-account backup stores, macOS
         # Keychain-vs-file routing, the per-process capability cache). Reads its
-        # live config (platform, _logger, credentials_dir) back off this switcher.
+        # live config (platform, _logger, credentials_dir,
+        # backup_keychain_service) back off this switcher.
         # Constructed BEFORE run_migrations(), which performs storage ops on macOS.
         # One store per switcher: the capability cache is per-process.
-        self._store = CredentialStore(self)
+        self._store = self._make_store()
 
         # The active read's verdict, PER THREAD. Set by _build_accounts_info
         # from the active slot's own read; consumed later by the usage
@@ -382,9 +409,178 @@ class ClaudeAccountSwitcher:
         # backup credentials out of Credential Manager into files). Imported
         # lazily to avoid a circular import, and self-contained so it never
         # aborts construction. No-op on fresh installs / once recorded.
-        from claude_swap.migrations import run_migrations
+        if self.run_legacy_migrations:
+            from claude_swap.migrations import run_migrations
 
-        run_migrations(self)
+            run_migrations(self)
+
+    # -- provider hooks -----------------------------------------------------
+    #
+    # Each base body is the Claude-specific step its call sites used to run
+    # inline, moved verbatim. A provider subclass overrides these; module
+    # globals are resolved at call time so the suite's patch targets
+    # (`claude_swap.switcher.claude_credentials_lock`,
+    # `claude_swap.oauth.fetch_oauth_profile`, `claude_swap.session.*`) still
+    # reach the code they patch.
+
+    def _make_store(self) -> CredentialStore:
+        return CredentialStore(self)
+
+    def _live_credentials_lock(self):
+        """Context manager serializing live-credential mutation against the
+        CLI that owns the live login (Claude Code's proper-lockfile pair)."""
+        return claude_credentials_lock()
+
+    def _live_config_lock(self):
+        """Context manager guarding the live config file (``~/.claude.json``)."""
+        return claude_config_lock()
+
+    def _resolve_token_identity(self, creds: str) -> dict | None:
+        """The profile oracle: whose credential is this blob?
+
+        ``{uuid, email, organizationUuid}`` or None (UNRESOLVABLE -- offline,
+        401, schema drift; never "wrong"). Takes the whole blob, not the
+        access token, so a provider whose identity is carried inside the
+        credential can answer offline.
+        """
+        return oauth.fetch_oauth_profile(oauth.extract_access_token(creds) or "")
+
+    def _snapshot_live_config(self) -> str | None:
+        """Raw text of the live config file; None when ABSENT.
+
+        Read errors propagate (callers map them to their own ConfigError).
+        On the switch path the text is both the rollback snapshot and the
+        outgoing slot's config backup.
+        """
+        config_path = self._get_claude_config_path()
+        if not config_path.exists():
+            return None
+        return config_path.read_text(encoding="utf-8")
+
+    def _live_config_data(self) -> dict | None:
+        """The live config file parsed (None when absent or unreadable)."""
+        return self._read_json(self._get_claude_config_path())
+
+    def _apply_live_config(
+        self, target_config: dict, emit_output: bool, warnings_out: list[str]
+    ) -> None:
+        """Point the live config at the switch target's identity.
+
+        Re-reads the config rather than reusing the pre-write snapshot: the
+        credential write just before this can itself rewrite
+        ``~/.claude.json`` (managed-key ``primaryApiKey`` /
+        ``customApiKeyResponses``), and a stale snapshot would undo it.
+
+        Preserves local settings/projects when a readable config exists, only
+        swapping in ``oauthAccount``. Falls back to the full backup config
+        when no usable local config exists.
+        `_read_json` answers None for ABSENT and for TORN alike, so a torn
+        ~/.claude.json fell to the else branch and the 1-key backup config
+        was written over the user's whole file — measured through the public
+        `switch_to`: `switched: True` returned with `projects`, `mcpServers`
+        and `userID` gone.
+
+        Back it up before replacing it, rather than refusing. Upstream
+        REPLACES a malformed config here on purpose
+        (`test_clean_switch_fallback_when_local_config_malformed` — a machine
+        being seeded by import, where the leftover file is noise), and
+        nothing in scope separates that from a working install whose config
+        just tore: measured, both reach this line with `current_account` set
+        and `_get_current_account()` None. So keep upstream's behaviour and
+        stop it being LOSSY: the bytes survive next to the config, named,
+        and the switch still lands.
+
+        One body for both `_perform_switch` branches: the normal branch's
+        copy once tested truthiness and, on a torn config read as None,
+        raised `'NoneType' object does not support item assignment` with no
+        salvage copy, losing the user's torn config for good. Absent and
+        unreadable both fall to the same salvage-then-replace.
+        """
+        config_path = self._get_claude_config_path()
+        current_config_data = self._read_json(config_path)
+        if current_config_data is not None:
+            # `is not None`, not truthiness. A VALID but empty `{}` is
+            # readable and loses nothing by being spliced; the falsy form
+            # sent it down the salvage branch and told the user it "could not
+            # be parsed", which is the same ""-vs-None conflation this branch
+            # exists to separate.
+            current_config_data["oauthAccount"] = target_config["oauthAccount"]
+            self._write_json(config_path, current_config_data)
+        else:
+            if config_path.exists():
+                self._salvage_unreadable(config_path, emit_output, warnings_out)
+            self._write_json(config_path, target_config)
+
+    def _restore_live_config(self, text: str) -> None:
+        """Rollback counterpart of ``_apply_live_config``: put the snapshot
+        text back verbatim (0600)."""
+        config_path = self._get_claude_config_path()
+        config_path.write_text(text, encoding="utf-8")
+        if sys.platform != "win32":
+            os.chmod(config_path, 0o600)
+
+    def _synth_config_for(self, identity: dict) -> dict:
+        """Config backup for an account captured without a live config file
+        (token/API-key accounts). ``identity`` carries at least ``email``."""
+        return {
+            "oauthAccount": {
+                "emailAddress": identity["email"],
+                "accountUuid": "",
+                "organizationUuid": None,
+                "organizationName": None,
+            }
+        }
+
+    def _store_env_guard(self) -> bool:
+        """True when the live store is redirected away from the default one
+        the consume and refresh paths resolve, so consuming against it is
+        refused (see both call sites)."""
+        return bool(os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"))
+
+    def _running_instances(self):
+        """``(sessions, ide_instances)`` of the provider's running clients,
+        for the list view."""
+        return get_running_instances()
+
+    def _scan_live_sessions(self, session_dir: Path):
+        from claude_swap.session import scan_live_sessions
+
+        return scan_live_sessions(session_dir)
+
+    def _read_session_credentials(self, session_dir: Path) -> str | None:
+        from claude_swap.session import read_session_credentials
+
+        return read_session_credentials(session_dir)
+
+    def _read_session_identity(self, session_dir: Path) -> tuple[str, str] | None:
+        from claude_swap.session import read_session_identity
+
+        return read_session_identity(session_dir)
+
+    def _session_identity_drifted(
+        self, session_dir: Path, email: str, org_uuid: str
+    ) -> bool:
+        """``session.session_identity_drifted`` with this provider's profile
+        identity reader (the comparison stays single-sourced in session.py)."""
+        from claude_swap.session import session_identity_drifted
+
+        return session_identity_drifted(
+            session_dir, email, org_uuid, read_identity=self._read_session_identity
+        )
+
+    def _profile_is_quiescent(self, session_dir: Path) -> bool:
+        from claude_swap.session import profile_is_quiescent
+
+        return profile_is_quiescent(session_dir)
+
+    def live_login_path(self) -> Path:
+        """The file whose mtime moves when the live login changes (menubar
+        change watch)."""
+        return self._get_claude_config_path()
+
+    def current_identity(self) -> tuple[str, str] | None:
+        """Public alias of ``_get_current_account``: ``(email, org_uuid)``."""
+        return self._get_current_account()
 
     def _is_running_in_container(self) -> bool:
         """Check if running inside a container."""
@@ -2052,7 +2248,7 @@ class ClaudeAccountSwitcher:
         # reads/writes the redirected one is the stale-copy failure class by
         # construction — refuse (transient, so nothing strikes) rather than
         # operate on a store CC left behind.
-        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        if self._store_env_guard():
             self._logger.warning(
                 "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
                 "when capturing a credential but not when consuming one, "
@@ -2098,12 +2294,7 @@ class ClaudeAccountSwitcher:
         self, account_num: str, email: str, snapshot: str
     ) -> "oauth.RefreshOutcome":
         """Body of ``consume_backup_grant``; caller holds the consume lock."""
-        from claude_swap.session import (
-            is_session_stale,
-            read_session_credentials,
-            session_dir_for,
-            session_identity_drifted,
-        )
+        from claude_swap.session import is_session_stale, session_dir_for
 
         try:
             with FileLock(self.lock_file):
@@ -2184,7 +2375,7 @@ class ClaudeAccountSwitcher:
                 )
                 if not self._live_session_pids(account_num, email):
                     sdir = session_dir_for(self.backup_dir, account_num, email)
-                    profile = read_session_credentials(sdir)
+                    profile = self._read_session_credentials(sdir)
                     if (
                         profile
                         # A marked profile's credentials are presumed stale
@@ -2192,7 +2383,9 @@ class ClaudeAccountSwitcher:
                         # deliberate re-add/import): never let it supersede
                         # the backup it is presumed stale against.
                         and not is_session_stale(sdir)
-                        and not session_identity_drifted(sdir, email, org_uuid)
+                        and not self._session_identity_drifted(
+                            sdir, email, org_uuid
+                        )
                     ):
                         prof_oauth = oauth.extract_oauth_data(profile)
                         cur_exp = (input_oauth or {}).get("expiresAt") or 0
@@ -2693,16 +2886,11 @@ class ClaudeAccountSwitcher:
             line = _label_token_status("active profile", creds)
             return [line] if line is not None else []
 
-        from claude_swap.session import (
-            read_session_credentials,
-            session_identity_drifted,
-        )
-
         lines: list[str] = []
         session_dir = self._session_dir(str(num), email)
-        session_creds = read_session_credentials(session_dir)
+        session_creds = self._read_session_credentials(session_dir)
         if session_creds:
-            if session_identity_drifted(session_dir, email, org_uuid):
+            if self._session_identity_drifted(session_dir, email, org_uuid):
                 lines.append("session profile: ignored (different account)")
             else:
                 line = _label_token_status("session profile", session_creds)
@@ -2720,9 +2908,7 @@ class ClaudeAccountSwitcher:
         usage heuristics that read this; a destructive guard must use
         ``_ensure_no_live_session``, which asks the readability question too.
         """
-        from claude_swap.session import scan_live_sessions
-
-        sessions, _ = scan_live_sessions(self._session_dir(account_num, email))
+        sessions, _ = self._scan_live_sessions(self._session_dir(account_num, email))
         return [s.pid for s in sessions]
 
     def _ensure_no_live_session(self, account_num: str, email: str, action: str) -> None:
@@ -2733,8 +2919,6 @@ class ClaudeAccountSwitcher:
         ``.credentials.json`` overwritten) and slot removal, so treating an
         unreadable record as an absent one runs them under a live instance.
         """
-        from claude_swap.session import scan_live_sessions
-
         pids = self._live_session_pids(account_num, email)
         if pids:
             raise SessionError(
@@ -2743,7 +2927,7 @@ class ClaudeAccountSwitcher:
                 f"Exit it first, then retry {action}."
             )
         session_dir = self._session_dir(account_num, email)
-        _, unreadable = scan_live_sessions(session_dir)
+        _, unreadable = self._scan_live_sessions(session_dir)
         if unreadable:
             raise SessionError(
                 f"Account-{account_num} ({email}) has {unreadable} session "
@@ -2798,17 +2982,15 @@ class ClaudeAccountSwitcher:
         re-bootstraps); and anything unreadable, because a read error is not
         evidence of drift.
         """
-        from claude_swap.session import (
-            is_session_stale,
-            read_session_credentials,
-            session_identity_drifted,
-        )
+        from claude_swap.session import is_session_stale
 
         session_dir = self._session_dir(account_num, email)
         if is_session_stale(session_dir):
             return None
-        profile = read_session_credentials(session_dir)
-        if not profile or session_identity_drifted(session_dir, email, org_uuid):
+        profile = self._read_session_credentials(session_dir)
+        if not profile or self._session_identity_drifted(
+            session_dir, email, org_uuid
+        ):
             return None
         backup, unreadable = self._read_account_credentials_ex(account_num, email)
         if unreadable:
@@ -2849,11 +3031,9 @@ class ClaudeAccountSwitcher:
         captured, and the two now hold the same generation. Returns whether
         the backup was advanced.
         """
-        from claude_swap.session import profile_is_quiescent
-
         session_dir = self._session_dir(account_num, email)
         with FileLock(self.lock_file):
-            if not profile_is_quiescent(session_dir):
+            if not self._profile_is_quiescent(session_dir):
                 return False
             profile = self._session_profile_ahead(account_num, email, org_uuid)
             if profile is None:
@@ -3235,7 +3415,7 @@ class ClaudeAccountSwitcher:
             # spent generation, and on the refusal path would discard the only
             # live copy of that lineage.
             return unverified("the access token is expired")
-        profile = oauth.fetch_oauth_profile(token)
+        profile = self._resolve_token_identity(creds)
         if not profile:
             return unverified("the identity lookup did not resolve")
         # Uuid first, like ``_resolved_matches_slot_identity``: uuids are
@@ -3538,13 +3718,14 @@ class ClaudeAccountSwitcher:
             )
             self._reject_credential_drift_since_verify(current_creds)
 
-            config_path = self._get_claude_config_path()
             try:
-                current_config = config_path.read_text(encoding="utf-8")
+                current_config = self._snapshot_live_config()
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
             except PermissionError:
                 raise ConfigError("Permission denied reading Claude config")
+            if current_config is None:
+                raise ConfigError("Claude config file not found")
 
             # AFTER the read, because it licenses those bytes. Ahead of it, a
             # `/login` landing between the check and the read stores a config
@@ -3664,16 +3845,17 @@ class ClaudeAccountSwitcher:
         )
         self._reject_credential_drift_since_verify(current_creds)
 
-        config_path = self._get_claude_config_path()
         try:
-            current_config = config_path.read_text(encoding="utf-8")
+            current_config = self._snapshot_live_config()
         except FileNotFoundError:
             raise ConfigError("Claude config file not found")
         except PermissionError:
             raise ConfigError("Permission denied reading Claude config")
+        if current_config is None:
+            raise ConfigError("Claude config file not found")
 
         # Get account UUID and org fields
-        config_data = self._read_json(config_path)
+        config_data = self._live_config_data()
         oauth_data = config_data.get("oauthAccount", {})
         account_uuid = oauth_data.get("accountUuid", "") or ""
         organization_uuid = oauth_data.get("organizationUuid", "") or ""
@@ -3806,14 +3988,7 @@ class ClaudeAccountSwitcher:
                     "scopes": list(SETUP_TOKEN_SCOPES),
                 }
             })
-        config = json.dumps({
-            "oauthAccount": {
-                "emailAddress": email,
-                "accountUuid": "",
-                "organizationUuid": None,
-                "organizationName": None,
-            }
-        })
+        config = json.dumps(self._synth_config_for({"email": email}))
 
         # If the account already exists (same email, personal), refresh in place.
         if slot is None and self._account_exists(email, ""):
@@ -4217,7 +4392,7 @@ class ClaudeAccountSwitcher:
         # or persisting against the left-behind store is not. The distinct
         # kind surfaces the remedy (ERROR_NOTES) instead of striking a
         # healthy account.
-        if os.environ.get("CLAUDE_SECURESTORAGE_CONFIG_DIR"):
+        if self._store_env_guard():
             self._logger.warning(
                 "CLAUDE_SECURESTORAGE_CONFIG_DIR is set; cswap mirrors it "
                 "when capturing a credential but not when refreshing one, "
@@ -4277,7 +4452,7 @@ class ClaudeAccountSwitcher:
             with (
                 FileLock(self.credentials_dir / f".consume-{account_num}.lock"),
                 FileLock(self.lock_file),
-                claude_credentials_lock(),
+                self._live_credentials_lock(),
             ):
                 live = self._read_credentials()
                 if live is None:
@@ -4579,7 +4754,7 @@ class ClaudeAccountSwitcher:
                         # _clear_managed_key) — the config lock covers just
                         # this write. A timeout here is a live-write failure
                         # (the grant is already consumed), not a defer.
-                        with claude_config_lock():
+                        with self._live_config_lock():
                             self._write_credentials(working)  # active store — CC reads this
                     except Exception:
                         live_ok = False
@@ -4679,9 +4854,7 @@ class ClaudeAccountSwitcher:
             if verdict is False:
                 return  # known-foreign lineage; already warned
             if verdict is not True:
-                resolved = oauth.fetch_oauth_profile(
-                    oauth.extract_access_token(creds) or ""
-                )
+                resolved = self._resolve_token_identity(creds)
                 if resolved is None:
                     self._logger.debug(
                         "Ownership probe for account %s's drifted live "
@@ -4721,7 +4894,7 @@ class ClaudeAccountSwitcher:
                 self._provenance_warned.discard((account_num, email, "resync"))
             with (
                 FileLock(self.lock_file),
-                claude_credentials_lock(),
+                self._live_credentials_lock(),
             ):
                 # Identity re-check under the lock: a switch/login landing in
                 # the gap means the live store is no longer this account's.
@@ -4820,11 +4993,6 @@ class ClaudeAccountSwitcher:
         if is_active:
             return self._fetch_active_usage(str(num), email, creds, org_uuid)
 
-        from claude_swap.session import (
-            read_session_credentials,
-            session_identity_drifted,
-        )
-
         has_live_session = bool(self._live_session_pids(str(num), email))
 
         # A session profile supersedes the backup copy as this account's
@@ -4837,8 +5005,10 @@ class ClaudeAccountSwitcher:
         # no persist): rotating the profile's family here would log the live
         # claude out the same way.
         session_dir = self._session_dir(str(num), email)
-        session_creds = read_session_credentials(session_dir)
-        if session_creds and session_identity_drifted(session_dir, email, org_uuid):
+        session_creds = self._read_session_credentials(session_dir)
+        if session_creds and self._session_identity_drifted(
+            session_dir, email, org_uuid
+        ):
             # An in-session /login re-pointed the profile at a different
             # account; fetching with its credential would record THAT
             # account's usage under this slot's label. The profile no longer
@@ -5589,7 +5759,7 @@ class ClaudeAccountSwitcher:
 
         # Running instances
         try:
-            sessions, ide_instances = get_running_instances()
+            sessions, ide_instances = self._running_instances()
 
             if sessions or ide_instances:
                 # Group by (label, folder) to avoid repetitive lines
@@ -6421,7 +6591,7 @@ class ClaudeAccountSwitcher:
         if not access_token:
             return result  # raw API key / garbled JSON — nothing to resolve
         try:
-            result["resolved"] = oauth.fetch_oauth_profile(access_token)
+            result["resolved"] = self._resolve_token_identity(live)
         except Exception as e:
             # fetch_oauth_profile swallows its own failures; this belt keeps
             # the invariant structural — the oracle is advisory and must
@@ -6601,7 +6771,7 @@ class ClaudeAccountSwitcher:
             pass  # Keychain backend or file absent
         live_oauth_account: dict | None = None
         try:
-            config = self._read_json(self._get_claude_config_path())
+            config = self._live_config_data()
             if isinstance(config, dict):
                 live_oauth_account = config.get("oauthAccount")
         except Exception:
@@ -6713,8 +6883,6 @@ class ClaudeAccountSwitcher:
         The post-switch display runs after the lock releases so that persist
         callbacks inside list_accounts() can re-acquire it.
         """
-        from claude_swap.session import scan_live_sessions
-
         self._refuse_session_shell()
         warnings_out: list[str] = []
         # Session-mode drift. Switching the default login to an account that
@@ -6730,7 +6898,7 @@ class ClaudeAccountSwitcher:
         pre_email = pre_account.get("email", "")
         if pre_email:
             pre_org = pre_account.get("organizationUuid", "") or ""
-            sessions, unreadable = scan_live_sessions(
+            sessions, unreadable = self._scan_live_sessions(
                 self._session_dir(target_account, pre_email)
             )
             pids = [s.pid for s in sessions]
@@ -6787,7 +6955,11 @@ class ClaudeAccountSwitcher:
         # ~/.claude.json.lock likewise keeps the oauthAccount splice from
         # interleaving with Claude Code's own config writes. Everything under
         # here is local I/O — no network while locks are held.
-        with FileLock(self.lock_file), claude_credentials_lock(), claude_config_lock():
+        with (
+            FileLock(self.lock_file),
+            self._live_credentials_lock(),
+            self._live_config_lock(),
+        ):
             data = self._get_sequence_data()
             active_account = data.get("activeAccountNumber")
             current_account = str(active_account) if active_account is not None else None
@@ -6799,8 +6971,6 @@ class ClaudeAccountSwitcher:
                 current_account = self._find_account_slot(
                     data, current_email, current_org_uuid
                 )
-
-            config_path = self._get_claude_config_path()
 
             # Direct activation path: there is no live Claude session yet
             # (e.g. right after import), claude-swap has no tracked active
@@ -6856,15 +7026,12 @@ class ClaudeAccountSwitcher:
                     # Fresh machine: normalize "" so the stash, composer, and
                     # rollback all see "nothing to preserve".
                     rollback_creds = rollback_creds or None
-                if config_path.exists():
-                    try:
-                        rollback_config_text = config_path.read_text(
-                            encoding="utf-8"
-                        )
-                    except OSError as e:
-                        raise ConfigError(
-                            f"Cannot snapshot live config before activation: {e}"
-                        )
+                try:
+                    rollback_config_text = self._snapshot_live_config()
+                except OSError as e:
+                    raise ConfigError(
+                        f"Cannot snapshot live config before activation: {e}"
+                    )
 
                 # Invariant II (issue #117): this path skips the backup step,
                 # so the live credential it replaces would otherwise have no
@@ -6909,45 +7076,12 @@ class ClaudeAccountSwitcher:
                     )
                     creds_written = True
 
-                    # Mirror the normal switch path: preserve existing local
-                    # settings/projects when ~/.claude.json already exists, only
-                    # swapping in oauthAccount. Fall back to the full imported
-                    # config when no usable local config exists.
-                    # `_read_json` answers None for ABSENT and for TORN alike,
-                    # so a torn ~/.claude.json fell to the else branch and the
-                    # 1-key backup config was written over the user's whole
-                    # file — measured through the public `switch_to`:
-                    # `switched: True` returned with `projects`, `mcpServers`
-                    # and `userID` gone.
-                    #
-                    # Back it up before replacing it, rather than refusing.
-                    # Upstream REPLACES a malformed config here on purpose
-                    # (`test_clean_switch_fallback_when_local_config_malformed`
-                    # — a machine being seeded by import, where the leftover
-                    # file is noise), and nothing in scope separates that from
-                    # a working install whose config just tore: measured, both
-                    # reach this line with `current_account` set and
-                    # `_get_current_account()` None. So keep upstream's
-                    # behaviour and stop it being LOSSY: the bytes survive next
-                    # to the config, named, and the switch still lands.
-                    existing_config = (
-                        self._read_json(config_path) if config_path.exists() else None
+                    # Mirror the normal switch path: splice the target's
+                    # oauthAccount into the live config, salvaging a torn one
+                    # (see _apply_live_config).
+                    self._apply_live_config(
+                        target_config_data, emit_output, warnings_out
                     )
-                    if existing_config is not None:
-                        # `is not None`, not truthiness. A VALID but empty `{}`
-                        # is readable and loses nothing by being spliced; the
-                        # falsy form sent it down the salvage branch and told
-                        # the user it "could not be parsed", which is the same
-                        # ""-vs-None conflation this branch exists to separate.
-                        existing_config["oauthAccount"] = target_oauth
-                        self._write_json(config_path, existing_config)
-                    else:
-                        if config_path.exists():
-                            salvage = self._salvage_unreadable(
-                                config_path, emit_output, warnings_out
-                            )
-                            del salvage
-                        self._write_json(config_path, target_config_data)
                     config_written = True
 
                     data["activeAccountNumber"] = int(target_account)
@@ -6956,11 +7090,7 @@ class ClaudeAccountSwitcher:
                 except Exception:
                     if config_written and rollback_config_text is not None:
                         try:
-                            config_path.write_text(
-                                rollback_config_text, encoding="utf-8"
-                            )
-                            if sys.platform != "win32":
-                                os.chmod(config_path, 0o600)
+                            self._restore_live_config(rollback_config_text)
                         except Exception as e:
                             self._logger.error(
                                 f"Failed to rollback config: {e}"
@@ -7015,7 +7145,9 @@ class ClaudeAccountSwitcher:
                         "Current account credential is empty (Keychain unreadable?); "
                         "refusing to overwrite its backup"
                     )
-                original_config = config_path.read_text(encoding="utf-8")
+                original_config = self._snapshot_live_config()
+                if original_config is None:
+                    raise ConfigError("Claude config file not found")
             except FileNotFoundError:
                 raise ConfigError("Claude config file not found")
             except PermissionError:
@@ -7026,7 +7158,6 @@ class ClaudeAccountSwitcher:
                 original_config=original_config,
                 original_account_num=current_account,
                 original_email=current_email,
-                config_path=config_path,
             )
 
             try:
@@ -7194,24 +7325,9 @@ class ClaudeAccountSwitcher:
                 if not oauth_section:
                     raise SwitchError("Invalid oauthAccount in backup")
 
-                # `is not None`, not truthiness — same conflation the direct-
-                # activation branch above (:6148-6165) already guards
-                # against. A torn ~/.claude.json reads as None here too;
-                # `current_config_data["oauthAccount"] = ...` on that None
-                # raised `'NoneType' object does not support item
-                # assignment` with no salvage copy, losing the user's torn
-                # config for good. Absent/unreadable both fall to the same
-                # salvage-then-replace the direct-activation branch uses.
-                current_config_data = self._read_json(config_path)
-                if current_config_data is not None:
-                    current_config_data["oauthAccount"] = oauth_section
-                    self._write_json(config_path, current_config_data)
-                else:
-                    if config_path.exists():
-                        self._salvage_unreadable(
-                            config_path, emit_output, warnings_out
-                        )
-                    self._write_json(config_path, target_config_data)
+                self._apply_live_config(
+                    target_config_data, emit_output, warnings_out
+                )
                 transaction.record_step("config_written")
                 self._logger.info("Updated config file")
 
@@ -7300,7 +7416,10 @@ class ClaudeAccountSwitcher:
         """
         self._refuse_session_shell()
         legacy = get_legacy_backup_root()
-        legacy_distinct = legacy != self.backup_dir
+        # Against the ROOT, not backup_dir: on macOS/Windows the legacy path
+        # IS the root, and a provider subdir would otherwise read it as a
+        # stale legacy dir and rmtree the whole shared root.
+        legacy_distinct = legacy != self.root_dir
 
         # Refuse while any session-mode claude is running: purging would pull
         # its profile (and keychain entry) out from under a live process.
@@ -7310,12 +7429,10 @@ class ClaudeAccountSwitcher:
             if sessions_root.is_dir()
             else []
         )
-        from claude_swap.session import scan_live_sessions
-
         live = {}
         unreadable = {}
         for d in session_dirs:
-            sessions, bad = scan_live_sessions(d)
+            sessions, bad = self._scan_live_sessions(d)
             if sessions:
                 live[d.name] = [s.pid for s in sessions]
             elif bad:
@@ -7386,7 +7503,9 @@ class ClaudeAccountSwitcher:
                 if self.platform == Platform.MACOS:
                     for username in usernames:
                         try:
-                            macos_keychain.delete_password(SECURITY_SERVICE, username)
+                            macos_keychain.delete_password(
+                                self.backup_keychain_service, username
+                            )
                             removed_items.append(f"Credential: {username}")
                         except Exception:
                             pass  # Ignore errors during purge

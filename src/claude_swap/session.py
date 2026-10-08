@@ -46,7 +46,7 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
-from typing import TYPE_CHECKING, NoReturn
+from typing import TYPE_CHECKING, Callable, NoReturn
 
 from claude_swap import macos_keychain
 from claude_swap.claude_locks import proper_lockfile
@@ -458,7 +458,12 @@ def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
     return email, oauth_account.get("organizationUuid") or ""
 
 
-def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bool:
+def session_identity_drifted(
+    session_dir: Path,
+    email: str,
+    org_uuid: str,
+    read_identity: Callable[[Path], tuple[str, str] | None] | None = None,
+) -> bool:
     """Whether the profile is logged in as a *different* account than its slot.
 
     An in-session ``/login`` (e.g. after the slot's account hit its rate limit
@@ -468,8 +473,12 @@ def session_identity_drifted(session_dir: Path, email: str, org_uuid: str) -> bo
     have a value. An unreadable identity is NOT drift — missing metadata
     degrades to trusting the profile (its token family is normally the slot's
     freshest) rather than abandoning it over a broken ``.claude.json``.
+
+    ``read_identity`` swaps the profile identity reader (a provider whose
+    profile records identity elsewhere); None = ``read_session_identity``,
+    resolved at call time.
     """
-    identity = read_session_identity(session_dir)
+    identity = (read_identity or read_session_identity)(session_dir)
     if identity is None:
         return False
     profile_email, profile_org = identity
