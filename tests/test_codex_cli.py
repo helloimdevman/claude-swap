@@ -297,6 +297,25 @@ def test_codex_subcommand_help_has_no_claude_only_examples(monkeypatch, capsys):
     assert "cswap auto --model Fable" in capsys.readouterr().out  # Claude's kept
 
 
+
+def test_codex_purge_and_config_help_describe_codex(monkeypatch, capsys):
+    assert _main(monkeypatch, "codex", "--help") == 0
+    out = capsys.readouterr().out
+    assert "purge                      remove all Codex accounts and their data" in out
+    assert "remove all claude-swap data" not in out
+    assert _main(monkeypatch, "codex", "config", "--help") == 0
+    out = capsys.readouterr().out
+    assert "Codex settings" in out and "codex folder of the backup root" in out
+    assert "cswap codex config set autoswitch.threshold 80" in out
+    assert "cswap config" not in out and "Fable" not in out
+    # Claude's help keeps its own wording.
+    assert _main(monkeypatch, "--help") == 0
+    assert "purge                      remove all claude-swap data" in capsys.readouterr().out
+    assert _main(monkeypatch, "config", "--help") == 0
+    out = capsys.readouterr().out
+    assert "Read and edit claude-swap settings (settings.json in the backup root)." in out
+    assert "  cswap config set autoswitch.threshold 80\n" in out and "Fable" in out
+
 # -- JSON provider -------------------------------------------------------------
 
 def test_codex_error_envelope_names_the_provider(monkeypatch, codex_cls, capsys):

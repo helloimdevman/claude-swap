@@ -233,3 +233,17 @@ class TestImportUsage:
         with pytest.raises(TransferError, match=f"cswap import-usage {path}"):
             import_usage(s, str(path))
         assert not s._usage_store.path.exists() or "42.0" not in s._usage_store.path.read_text()
+
+
+def test_the_claude_refusal_does_not_import_the_codex_switcher(monkeypatch):
+    """Claude's import path names the other provider from constants."""
+    import sys
+    from types import SimpleNamespace
+
+    from claude_swap import transfer
+    from claude_swap.exceptions import TransferError
+
+    monkeypatch.setitem(sys.modules, "claude_swap.codex_switcher", None)  # import fails
+    claude = SimpleNamespace(provider_name="claude", display_name="Claude Code", cli_prefix="cswap")
+    with pytest.raises(TransferError, match="holds Codex accounts.*cswap codex import"):
+        transfer._refuse_other_provider(claude, {"provider": "codex"}, "x.json", "import")

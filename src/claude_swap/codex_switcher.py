@@ -38,6 +38,7 @@ from claude_swap.codex_store import (
     CodexStoreUnsupported,
 )
 from claude_swap.exceptions import (
+    ClaudeSwitchError,
     ConfigError,
     CredentialReadError,
     SessionError,
@@ -65,10 +66,10 @@ CODEX_SENTINEL_NOTES = {
     **SENTINEL_NOTES,
     USAGE_TOKEN_EXPIRED: (
         "token expired or rejected — open Codex to refresh it "
-        "(if it was revoked: cswap codex add --login)"
+        f"(if it was revoked: {CODEX_CLI_PREFIX} add --login)"
     ),
     USAGE_RELOGIN_REQUIRED: (
-        "re-login needed — refresh token dead; run: cswap codex add --login"
+        f"re-login needed — refresh token dead; run: {CODEX_CLI_PREFIX} add --login"
     ),
 }
 
@@ -76,7 +77,7 @@ CODEX_ERROR_NOTES = {
     **ERROR_NOTES,
     "stash-unreadable": (
         "this slot's stashed successor is unreadable — unlock the keychain "
-        "or fix the file, then retry; `cswap codex unclaimed` inspects it"
+        f"or fix the file, then retry; `{CODEX_CLI_PREFIX} unclaimed` inspects it"
     ),
 }
 
@@ -85,40 +86,6 @@ CODEX_ERROR_NOTES = {
 # login/src/device_code_auth.rs). Younger ones may be another terminal's
 # login still in progress.
 _STALE_LOGIN_HOME_S = 3600
-
-
-def _forced_login_violation(creds: str, config: dict) -> str | None:
-    """Why Codex would log ``creds`` out at startup under ``config``, or None.
-
-    Mirrors ``enforce_login_restrictions`` (login/src/auth/manager.rs:
-    1315-1440), which DELETES a non-matching login: ``forced_login_method``
-    must match the login's kind; ``forced_chatgpt_workspace_id`` (a string or
-    a list, blank entries ignored) binds ChatGPT logins only, compared with the
-    id_token's ``chatgpt_account_id``.
-    """
-    is_api_key = codex_auth.is_api_key_blob(creds)
-    method = config.get("forced_login_method")
-    if method == "api" and not is_api_key:
-        return 'forced_login_method = "api" but this is a ChatGPT login'
-    if method == "chatgpt" and is_api_key:
-        return 'forced_login_method = "chatgpt" but this is an API-key login'
-    allowed = config.get("forced_chatgpt_workspace_id")
-    if isinstance(allowed, str):
-        allowed = [allowed]
-    if not isinstance(allowed, list) or is_api_key:
-        return None
-    allowed = [w.strip() for w in allowed if isinstance(w, str) and w.strip()]
-    if not allowed:
-        return None
-    tokens = codex_auth.chatgpt_tokens(creds) or {}
-    claims = codex_auth.decode_jwt_payload(tokens.get("id_token"))
-    workspace = codex_auth.auth_claims(claims).get("chatgpt_account_id")
-    if workspace in allowed:
-        return None
-    return (
-        f"forced_chatgpt_workspace_id allows {', '.join(allowed)} but this "
-        f"login belongs to {workspace or 'no workspace'}"
-    )
 
 
 class CodexAccountSwitcher(ClaudeAccountSwitcher):
@@ -137,6 +104,9 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
     )
     # Identity lives in the login itself (there is no config file).
     live_config_missing = "No live Codex login found"
+    # The menu bar title's prefix, so `cswap codex menubar` and Claude's
+    # item (plain "⇄") are told apart.
+    menubar_icon = "⇄ Codex"
     backup_subdir = CODEX_SUBDIR
     backup_keychain_service = "claude-swap-codex"
     run_legacy_migrations = False
@@ -157,6 +127,30 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         # `_api_key_identity`.
         self._api_key_identity_cache: tuple[tuple, dict | None] | None = None
         super().__init__(debug=debug)
+        # Inside a `cswap codex run` session's shell CODEX_HOME is the
+        # profile; every command (list, status, tui, watch, auto, …) must see
+        # the user's real default home instead. The profile path is kept so
+        # `cswap codex run` can still say what it replaced.
+        self._default_home_unknown = False
+        self.session_shell_home, known = codex_session.restore_default_home(
+            self.backup_dir / "sessions"
+        )
+        if not known:
+            self._distrust_default_home()
+
+    def _distrust_default_home(self) -> None:
+        """The default Codex home could not be determined (a session's shell
+        lost the recorded one): ``~/.codex`` is used, and for the rest of this
+        process the consume gate refreshes no stored login, since any of them
+        may be the real default's live lineage."""
+        self._default_home_unknown = True
+        msg = (
+            "CODEX_HOME pointed at a session profile and the default Codex home "
+            f"could not be determined; using {codex_store.codex_home()} and "
+            "refreshing no stored login in this run."
+        )
+        self._logger.warning(msg)
+        warning(msg, file=sys.stderr)
 
     # -- live store, locks, environment ------------------------------------
 
@@ -194,7 +188,9 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
     def _refuse_session_shell(self) -> None:
         """Refuse account mutation from inside a ``cswap codex run`` shell:
         with ``CODEX_HOME`` pointing into this store's session profiles, the
-        "live" login is the profile's, not the default one."""
+        "live" login is the profile's, not the default one. (``__init__``
+        already restores the default home; this catches a CODEX_HOME
+        re-pointed after the switcher was built.)"""
         home = os.environ.get("CODEX_HOME")
         if not home:
             return
@@ -203,7 +199,7 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         except ValueError:
             return
         raise SwitchError(
-            "This shell is inside a cswap codex run session profile "
+            f"This shell is inside a {self.cli_prefix} run session profile "
             "(CODEX_HOME points at it). Mutating accounts here would operate "
             "on the wrong live store — unset CODEX_HOME or run from a normal "
             "shell."
@@ -384,11 +380,9 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         return (ident["email"], ident["organizationUuid"] or "", ident["uuid"] or "")
 
     def _resolve_token_identity(self, creds: str) -> dict | None:
-        """The ownership oracle, offline: the id_token names its account."""
-        ident = codex_auth.identity(creds)
-        if ident is None:
-            return None
-        return {k: ident[k] for k in ("uuid", "email", "organizationUuid")}
+        """The ownership oracle, offline: the id_token names its account —
+        its own claim, not the stored account_id a hybrid gets wrong."""
+        return codex_auth.token_identity(creds)
 
     # -- synthesized config ----------------------------------------------------
 
@@ -424,13 +418,18 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         if not name:
             return
         self._workspace_names[org] = name
-        with FileLock(self.lock_file):
-            data = self._get_sequence_data()
-            slot = self._find_account_slot(data, identity["email"], org) if data else None
-            if slot and data["accounts"][slot].get("organizationName") != name:
-                data["accounts"][slot]["organizationName"] = name
-                data["lastUpdated"] = get_timestamp()
-                self._write_json(self.sequence_file, data)
+        try:
+            with FileLock(self.lock_file):
+                data = self._get_sequence_data()
+                slot = self._find_account_slot(data, identity["email"], org) if data else None
+                if slot and data["accounts"][slot].get("organizationName") != name:
+                    data["accounts"][slot]["organizationName"] = name
+                    data["lastUpdated"] = get_timestamp()
+                    self._write_json(self.sequence_file, data)
+        except (ClaudeSwitchError, OSError) as e:
+            # Advisory: `add --login` calls this after its temp home is gone,
+            # so failing here would throw away a completed browser login.
+            self._logger.warning(f"Could not store the workspace name {name!r}: {e}")
 
     def _synth_config_for(self, identity: dict) -> dict:
         return {
@@ -482,7 +481,7 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         if self._looks_like_api_key(creds):
             raise ValidationError(
                 "The active Codex login is an API key. Add it with "
-                "'cswap codex add-token <key>' instead."
+                f"'{self.cli_prefix} add-token <key>' instead."
             )
 
     def _reject_foreign_credential_capture(
@@ -525,7 +524,7 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         if ident is None:
             raise ConfigError(
                 "No active Codex login found. Log in with `codex login`, or "
-                "add an account with: cswap codex add --login"
+                f"add an account with: {self.relogin_hint('')}"
             )
         self._remember_workspace_name(creds, ident)
         super().add_account(slot=slot, assume_yes=assume_yes, alias=alias)
@@ -674,15 +673,28 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
     # -- switch ------------------------------------------------------------------
 
     def _read_target_credentials(self, account_num: str, email: str) -> str:
-        """The switch target's stored login, refused when Codex's
-        ``forced_*`` settings would delete it at startup.
+        """The switch target's stored login, refused when Codex could not
+        run it (``codex_session.login_problem``) or its ``forced_*`` settings
+        would delete it at startup.
 
         Read before any live-store write on both switch branches — on the
         direct branch also before the displaced-live stash. On the normal
         branch the outgoing login has already been backed up (or stashed) by
         then, which is a correct backup whether or not the switch goes on."""
         creds = super()._read_target_credentials(account_num, email)
-        reason = _forced_login_violation(creds, codex_store.read_codex_config())
+        if not codex_auth.is_api_key_blob(creds):
+            # An imported or hand-edited backup can lack what Codex needs
+            # (codex-spec gotcha 3), or name another account.
+            accounts = (self._get_sequence_data() or {}).get("accounts") or {}
+            org = accounts.get(account_num, {}).get("organizationUuid") or ""
+            problem = codex_session.login_problem(creds, email, org)
+            if problem:
+                raise SwitchError(
+                    f"Refusing to switch to Account-{account_num}: its stored "
+                    f"login is unusable ({problem}). Re-add it with: "
+                    + self.relogin_hint("", account_num)
+                )
+        reason = codex_auth.forced_login_violation(creds, codex_store.read_codex_config())
         if reason:
             raise SwitchError(
                 f"Refusing to switch to Account-{account_num}: {reason}, so "
@@ -734,6 +746,18 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         the lineage it was seeded with. Every consumer (usage collection,
         autoswitch's freshen, sessions) comes through here.
         """
+        if self._default_home_unknown or codex_session.in_sessions(
+            codex_store.codex_home(), self.backup_dir / "sessions"
+        ):
+            # The "live" login may not be the real default's (a session
+            # profile's, or ~/.codex standing in for an unknown default), so
+            # the default login's lineage could look inactive. `__init__`
+            # restores the real home when it can; this holds otherwise.
+            self._logger.info(
+                "The default Codex home is not known here; not consuming "
+                "account %s's refresh token.", account_num,
+            )
+            return oauth.RefreshOutcome(None, "transient")
         if not self._profile_is_quiescent(self._session_dir(account_num, email)):
             # A session may be running on this slot's lineage (the profile is
             # seeded from the backup). The base gate asks
@@ -846,6 +870,8 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         return payload
 
     def status(self, json_output: bool = False) -> dict | None:
+        # Kept: the base says "No active Codex account"; Codex's wording
+        # (and its tests, the menu bar's alert) say "login".
         if not json_output and self._get_current_account() is None:
             print(f"{bolded('Status:')} {dimmed('No active Codex login')}")
             return None

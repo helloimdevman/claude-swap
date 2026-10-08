@@ -304,10 +304,11 @@ def format_title(
     settings: MenuBarSettings,
     now: float | None = None,
     alias: str | None = None,
+    icon: str = ICON,
 ) -> str:
     """Build the menu-bar title from the active account and settings."""
     if active_email is None:
-        return ICON
+        return icon
     if now is None:
         now = time.time()
     segments: list[str] = []
@@ -331,8 +332,8 @@ def format_title(
             if isinstance(window, dict) and isinstance(window.get("pct"), (int, float)) and window.get("name"):
                 segments.append(f"{window['name']} {window['pct']:.0f}%")
     if not segments:
-        return ICON
-    return f"{ICON} " + " · ".join(segments)
+        return icon
+    return f"{icon} " + " · ".join(segments)
 
 
 def format_usage_log(email: str, usage: dict | str | None) -> str | None:
@@ -564,6 +565,8 @@ def run(switcher) -> int:
     switched_note = getattr(
         switcher, "switch_notice", ClaudeAccountSwitcher.switch_notice
     )
+    # Codex's title is tagged, so its item and Claude's stay told apart.
+    icon = getattr(switcher, "menubar_icon", ICON)
     kind = getattr(switcher, "token_kind", None)  # None: Claude's setup-token
     if kind:
         token_item, token_title, email_prompt, token_prompt = (
@@ -578,7 +581,7 @@ def run(switcher) -> int:
 
     class MenuBarApp(rumps.App):
         def __init__(self):
-            super().__init__(ICON, quit_button=None)
+            super().__init__(icon, quit_button=None)
             self.switcher = switcher
             self.settings = MenuBarSettings.load(settings_path)
             # The supported paced read path: per refresh it fetches only the
@@ -762,6 +765,7 @@ def run(switcher) -> int:
                 self.snapshot["active_usage"],
                 self.settings,
                 alias=self.snapshot.get("active_alias"),
+                icon=icon,
             )
             # Stop a rumps memory leak: rumps registers each menu item's callback
             # in the process-global NSApp._ns_to_py_and_callback, but Menu.clear()

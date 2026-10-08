@@ -835,3 +835,228 @@ class TestSwitcherHooks:
         monkeypatch.setenv("CODEX_HOME", str(profile))
         with pytest.raises(SwitchError, match="cswap codex run session profile"):
             seeded.remove_account("2")
+
+
+class TestSessionShell:
+    """Read-only commands run from a session's shell (codex's own shell
+    commands inherit ``CODEX_HOME=<profile>``) must see the user's real
+    default home, not the profile's login."""
+
+    def test_list_inside_a_session_shell_never_posts_the_default_login(
+        self, codex_home, monkeypatch
+    ):
+        s = _switcher()
+        _add(s, codex_home, **OTHER)
+        live = _add(s, codex_home, **PERSONAL, access_exp=int(time.time()) - 60)
+        inside = _profile(s)
+        inside.mkdir(parents=True)
+        (inside / "auth.json").write_text(cf.auth_json(**OTHER))
+        monkeypatch.setenv("CODEX_HOME", str(inside))
+        posted: list[str] = []
+        monkeypatch.setattr(
+            codex_auth, "try_refresh",
+            lambda creds, timeout_s=10.0: posted.append(creds) or RefreshOutcome(None, "transient"),
+        )
+        monkeypatch.setattr(
+            codex_auth, "request_usage",
+            lambda *a, **k: cf.wham_usage((1, 18000, int(time.time()) + 999)),
+        )
+
+        payload = _switcher().list_accounts(json_output=True)
+
+        assert posted == []
+        rows = {r["number"]: r for r in payload["accounts"]}
+        assert (rows[1]["active"], rows[2]["active"]) == (False, True)
+        assert (codex_home / "auth.json").read_text() == live
+
+    def test_a_custom_default_home_is_restored_for_every_command(
+        self, codex_home, monkeypatch
+    ):
+        custom = codex_home.parent / "custom-codex"
+        custom.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(custom))
+        s = _switcher()
+        _add(s, custom, **OTHER)
+        _add(s, custom, **PERSONAL)
+        (codex_home / "auth.json").write_text(cf.auth_json(**OTHER))  # stale ~/.codex
+        inside = _profile(s)
+        inside.mkdir(parents=True)
+        monkeypatch.setenv("CODEX_HOME", str(inside))
+        monkeypatch.setenv(codex_session.DEFAULT_HOME_ENV, str(custom))
+
+        s = _switcher()
+
+        assert os.environ["CODEX_HOME"] == str(custom)
+        assert codex_session.DEFAULT_HOME_ENV not in os.environ
+        assert s.current_identity() == ("user@example.com", "acct-personal")
+
+    def test_a_recorded_default_inside_a_profile_is_never_restored(
+        self, codex_home, monkeypatch
+    ):
+        s = _switcher()
+        inside = _profile(s)
+        inside.mkdir(parents=True)
+        monkeypatch.setenv("CODEX_HOME", str(inside))
+        monkeypatch.setenv(codex_session.DEFAULT_HOME_ENV, str(_profile(s, "2", "x@y")))
+
+        _switcher()
+
+        assert "CODEX_HOME" not in os.environ  # back to the implicit ~/.codex
+
+    def test_the_gate_refuses_while_the_live_home_is_a_profile(
+        self, codex_home, monkeypatch
+    ):
+        """Defense in depth: CODEX_HOME re-pointed into a profile after the
+        switcher was built still never reaches a refresh POST."""
+        s = _switcher()
+        _add(s, codex_home, **OTHER)
+        _add(s, codex_home, **PERSONAL, access_exp=int(time.time()) - 60)
+        inside = _profile(s, "1", "other@example.com")
+        inside.mkdir(parents=True)
+        (inside / "auth.json").write_text(cf.auth_json(**OTHER))
+        monkeypatch.setenv("CODEX_HOME", str(inside))
+        posted: list[str] = []
+        monkeypatch.setattr(
+            codex_auth, "try_refresh",
+            lambda creds, timeout_s=10.0: posted.append(creds) or RefreshOutcome(None, "transient"),
+        )
+        backup = s._read_account_credentials("2", "user@example.com")
+
+        outcome = s.consume_backup_grant("2", "user@example.com", backup)
+
+        assert (outcome.credentials, outcome.error) == (None, "transient")
+        assert posted == []
+
+    def test_a_run_built_inside_a_session_shell_still_says_so(
+        self, codex_home, execs, monkeypatch, capsys
+    ):
+        s = _switcher()
+        _add(s, codex_home, **OTHER)
+        _add(s, codex_home, **PERSONAL)
+        inside = _profile(s)
+        inside.mkdir(parents=True)
+        monkeypatch.setenv("CODEX_HOME", str(inside))
+
+        _run(_switcher(), "2", [])  # the switcher restored the default home
+
+        assert execs[0].args == []  # slot 2 is the default login: plain codex
+        assert "CODEX_HOME" not in execs[0].env
+        assert "points at a session profile" in capsys.readouterr().out
+
+    def test_an_unknown_default_home_refreshes_nothing(
+        self, codex_home, monkeypatch, capsys
+    ):
+        """The session's shell lost CSWAP_CODEX_DEFAULT_HOME: the default
+        home is unknown (here a custom one holding slot 2's live login, while
+        ~/.codex holds another), so no stored login may be refreshed."""
+        custom = codex_home.parent / "custom-codex"
+        custom.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(custom))
+        s = _switcher()
+        _add(s, custom, **OTHER)
+        _add(s, custom, **PERSONAL, access_exp=int(time.time()) - 60)
+        (codex_home / "auth.json").write_text(cf.auth_json(**OTHER))
+        inside = _profile(s)
+        inside.mkdir(parents=True)
+        monkeypatch.setenv("CODEX_HOME", str(inside))
+        monkeypatch.delenv(codex_session.DEFAULT_HOME_ENV, raising=False)
+        posted: list[str] = []
+        monkeypatch.setattr(
+            codex_auth, "try_refresh",
+            lambda creds, timeout_s=10.0: posted.append(creds) or RefreshOutcome(None, "transient"),
+        )
+        monkeypatch.setattr(
+            codex_auth, "request_usage",
+            lambda *a, **k: cf.wham_usage((1, 18000, int(time.time()) + 999)),
+        )
+        capsys.readouterr()
+
+        payload = _switcher().list_accounts(json_output=True)
+
+        assert posted == []
+        assert payload["provider"] == "codex"  # stdout stays JSON
+        assert "default Codex home could not be determined" in capsys.readouterr().err
+
+    def test_an_empty_recorded_default_is_the_implicit_home(
+        self, codex_home, monkeypatch, capsys
+    ):
+        s = _switcher()
+        _add(s, codex_home, **OTHER)
+        _add(s, codex_home, **PERSONAL)
+        inside = _profile(s, "2", "user@example.com")
+        inside.mkdir(parents=True)
+        monkeypatch.setenv("CODEX_HOME", str(inside))
+        monkeypatch.setenv(codex_session.DEFAULT_HOME_ENV, "")
+        posted: list[str] = []
+        monkeypatch.setattr(
+            codex_auth, "try_refresh",
+            lambda creds, timeout_s=10.0: posted.append(creds) or RefreshOutcome(None, "transient"),
+        )
+        capsys.readouterr()
+
+        s = _switcher()
+        backup = s._read_account_credentials("1", "other@example.com")
+        s.consume_backup_grant("1", "other@example.com", backup)
+
+        assert "CODEX_HOME" not in os.environ
+        assert posted == [backup]  # an inactive slot is refreshed, as before
+        assert "could not be determined" not in capsys.readouterr().err
+
+
+class TestRevokingCommands:
+    """``codex login``/``logout`` revoke the login of the home they run in
+    (codex-spec gotcha 1): never inside a home holding a stored account."""
+
+    @pytest.mark.parametrize("args", [
+        ["logout"], ["login"], ["login", "--device-auth"], ["--search", "logout"],
+        # An option's separate value hides the subcommand from a naive parse:
+        # any bare login/logout token fails closed.
+        ["-m", "o3", "logout"], ["-c", "k=v", "login"], ["--profile", "x", "logout"],
+        ["login", "status"], ["mcp", "logout", "srv"], ["exec", "login"],
+    ])
+    def test_refused_in_a_session(self, seeded, execs, args):
+        with pytest.raises(
+            SessionError, match="(?s)cswap codex add --login.*cswap codex remove.*longer"
+        ):
+            seeded.make_session_manager().run("1", args)
+        assert execs == []
+        assert seeded.gate_calls == []
+        assert not _profile(seeded).exists()
+
+    def test_refused_on_the_same_account_fast_path(self, seeded, execs):
+        with pytest.raises(SessionError, match="revoke"):
+            seeded.make_session_manager().run("2", ["logout"])
+        assert execs == []
+
+    def test_refused_on_the_default_launch(self, seeded, execs):
+        with pytest.raises(SessionError, match="revoke"):
+            seeded.make_session_manager().exec_default(["login"])
+        assert execs == []
+
+    @pytest.mark.parametrize("args", [
+        ["fix the logout bug"], ["exec", "fix the login bug"], ["--login-hint=x"],
+    ])
+    def test_non_revoking_commands_run(self, seeded, execs, args):
+        _run(seeded, "1", args)
+        assert execs[0].args == ["-c", FILE_STORE, *args]
+
+
+class TestForcedLogin:
+    """A shared config.toml whose forced_* settings the session's login
+    fails would make Codex delete the profile's login at startup."""
+
+    def test_a_session_codex_would_log_out_is_refused(self, seeded, execs, codex_home):
+        (codex_home / "config.toml").write_text('forced_chatgpt_workspace_id = "acct-team"\n')
+        with pytest.raises(SessionError, match="forced_chatgpt_workspace_id"):
+            seeded.make_session_manager().run("1", [])
+        assert execs == []
+
+    def test_a_matching_session_runs(self, seeded, execs, codex_home):
+        (codex_home / "config.toml").write_text('forced_chatgpt_workspace_id = "acct-other"\n')
+        _run(seeded, "1", [])
+        assert execs[0].args == ["-c", FILE_STORE]
+
+    def test_an_unshared_profile_is_held_to_its_own_config(self, seeded, execs, codex_home):
+        (codex_home / "config.toml").write_text('forced_login_method = "api"\n')
+        _run(seeded, "1", [], share=False)  # the profile has no config.toml
+        assert len(execs) == 1

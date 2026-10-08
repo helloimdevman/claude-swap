@@ -641,6 +641,55 @@ def block_real_codex_process_scan(monkeypatch):
     yield
 
 
+@pytest.fixture(autouse=True)
+def block_real_codex_binary(monkeypatch):
+    """No test may run the real ``codex``: a real ``codex login``/``logout``
+    revokes, and a real TUI hangs the run. Every launch resolves the binary
+    with ``shutil.which`` first (``add --login``, ``cswap codex run``), so
+    looking ``codex`` up fails the test unless the test fakes ``shutil.which``
+    and the launch itself (``fake_codex``, ``execs``); spawning anything named
+    ``codex`` fails too."""
+    import subprocess
+
+    def is_codex(cmd) -> bool:
+        if isinstance(cmd, (list, tuple)):
+            cmd = cmd[0] if cmd else ""
+        if isinstance(cmd, bytes):
+            cmd = os.fsdecode(cmd)
+        parts = str(cmd).split()
+        return bool(parts) and Path(parts[0]).stem == "codex"
+
+    def refuse(cmd) -> None:
+        if is_codex(cmd):
+            raise AssertionError(f"real codex launched in test: {cmd!r}")
+
+    real_which = shutil.which
+
+    def which(cmd, *args, **kwargs):
+        if is_codex(cmd):
+            raise AssertionError("real codex looked up in test; fake shutil.which and the launch")
+        return real_which(cmd, *args, **kwargs)
+
+    class GuardedPopen(subprocess.Popen):
+        def __init__(self, args, *a, **kw):
+            refuse(args)
+            super().__init__(args, *a, **kw)
+
+    monkeypatch.setattr(shutil, "which", which)
+    monkeypatch.setattr(subprocess, "Popen", GuardedPopen)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def close_codex_http_errors():
+    """Close the HTTPErrors ``codex_fixtures.http_error`` made (see there)."""
+    yield
+    from tests import codex_fixtures
+
+    while codex_fixtures.OPEN_HTTP_ERRORS:
+        codex_fixtures.OPEN_HTTP_ERRORS.pop().close()
+
+
 @pytest.fixture
 def temp_home(tmp_path: Path):
     """Create a temporary home directory for testing."""

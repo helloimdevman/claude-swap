@@ -27,6 +27,7 @@ from claude_swap.json_output import SCHEMA_VERSION as JSON_SCHEMA_VERSION
 from claude_swap.json_output import usage_from_json
 from claude_swap.models import Platform, get_timestamp, normalize_alias
 from claude_swap.oauth import credential_fingerprint
+from claude_swap.paths import CODEX_CLI_PREFIX, CODEX_DISPLAY_NAME
 
 if TYPE_CHECKING:
     from claude_swap.switcher import ClaudeAccountSwitcher
@@ -60,7 +61,6 @@ def _refuse_other_provider(
     write it into the wrong live store, so each side takes only its own
     documents and names the command that takes the other's.
     """
-    from claude_swap.codex_switcher import CodexAccountSwitcher
     from claude_swap.switcher import ClaudeAccountSwitcher
 
     provider = document.get("provider", "claude")
@@ -71,8 +71,13 @@ def _refuse_other_provider(
     if provider == switcher.provider_name:
         return
     kind = "usage document lists" if command == "import-usage" else "export holds"
+    # Constants, not the Codex switcher class: Claude's import path stays
+    # free of the Codex modules (as purge's is).
     other = {
-        cls.provider_name: cls for cls in (ClaudeAccountSwitcher, CodexAccountSwitcher)
+        ClaudeAccountSwitcher.provider_name: (
+            ClaudeAccountSwitcher.display_name, ClaudeAccountSwitcher.cli_prefix
+        ),
+        "codex": (CODEX_DISPLAY_NAME, CODEX_CLI_PREFIX),
     }.get(provider)
     if other is None:
         raise TransferError(
@@ -80,9 +85,9 @@ def _refuse_other_provider(
             "of cswap does not support."
         )
     raise TransferError(
-        f"This {kind} {other.display_name} accounts; '{switcher.cli_prefix} "
+        f"This {kind} {other[0]} accounts; '{switcher.cli_prefix} "
         f"{command}' takes {switcher.display_name} ones. Import it with: "
-        f"{other.cli_prefix} {command} {shlex.quote(source)}"
+        f"{other[1]} {command} {shlex.quote(source)}"
     )
 
 

@@ -826,14 +826,22 @@ def _config_command(argv: list[str]) -> None:
         unset_setting,
     )
 
+    def key_help(spec) -> str:
+        if _codex and spec.dotted == "autoswitch.model":
+            return "Unused for Codex, which reports no per-model limits"
+        return spec.help
+
     key_lines = "\n".join(
-        f"  {spec.dotted:<34}{spec.help} (default {format_setting_value(spec.default)})"
+        f"  {spec.dotted:<34}{key_help(spec)} (default {format_setting_value(spec.default)})"
         for spec in SETTING_SPECS.values()
     )
     parser = argparse.ArgumentParser(
         prog=f"{_prefix()} config",
         description=(
-            "Read and edit claude-swap settings (settings.json in the "
+            "Read and edit claude-swap's Codex settings (settings.json in the "
+            "codex folder of the backup root; ui.theme is shared with Claude)."
+            if _codex
+            else "Read and edit claude-swap settings (settings.json in the "
             "backup root)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -842,11 +850,11 @@ Keys:
 {key_lines}
 
 Examples:
-  cswap config                              # list effective settings
-  cswap config get autoswitch.threshold
-  cswap config set autoswitch.threshold 80
-  cswap config unset autoswitch.threshold   # back to the default
-  cswap config path                         # where settings.json lives
+  {_prefix()} config                              # list effective settings
+  {_prefix()} config get autoswitch.threshold
+  {_prefix()} config set autoswitch.threshold 80
+  {_prefix()} config unset autoswitch.threshold   # back to the default
+  {_prefix()} config path                         # where settings.json lives
         """,
     )
     parser.add_argument(
@@ -1132,11 +1140,13 @@ def _main(argv: list[str]) -> None:
         token_example = "sk-proj-..."
         run_example = "resume                   # forward args after '--' to codex"
         login_line = "  %(prog)s add --login                sign in a new account (codex login)\n"
+        purge_desc = "remove all Codex accounts and their data"
     else:
         product, token_kind, login_line = "Claude Code", "a setup-token or API key", ""
         token_example = "sk-ant-oat01-..."
         run_example = "--resume                 # forward args after '--' to claude"
         codex_line = "  %(prog)s codex <command>            the same, for OpenAI Codex CLI accounts\n"
+        purge_desc = "remove all claude-swap data"
 
     parser = argparse.ArgumentParser(
         prog=_prog_name(),
@@ -1175,7 +1185,7 @@ Commands:
   %(prog)s menubar                    macOS menu bar app
   %(prog)s menubar --install-service  keep the menu bar running via launchd
   %(prog)s upgrade                    self-upgrade to latest
-  %(prog)s purge                      remove all claude-swap data
+  %(prog)s purge                      {purge_desc}
 
 Aliases: ls=list  rm=remove  update=upgrade""",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1434,7 +1444,7 @@ The original flag spellings (%(prog)s --switch, %(prog)s --list, ...) keep worki
         a.split("=", 1)[0] in ("--login", "--device-auth") for a in argv
     ):
         parser.error("--login and --device-auth are only supported for codex "
-                     "(cswap codex add --login)")
+                     f"({paths.CODEX_CLI_PREFIX} add --login)")
 
     args = parser.parse_args(argv)
 

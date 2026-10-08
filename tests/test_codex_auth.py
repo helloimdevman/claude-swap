@@ -763,3 +763,38 @@ class TestCodexTestGuards:
         )
         specs = dict(conftest._freeze_real_store_specs())
         assert specs.get(home / ".codex") is False
+
+
+@_live_network
+def test_a_refresh_of_a_hybrid_login_reports_the_tokens_owner(urlopen):
+    """codex-spec gotcha 5: B's stored account_id over A's tokens. The
+    refreshed tokens are A's, so ``token_account`` must say A."""
+    data = cf.auth_dict()
+    data["tokens"]["account_id"] = "acct-team"
+    urlopen(cf.FakeResponse({"id_token": cf.id_token(), "refresh_token": "rt-new"}))
+
+    outcome = codex_auth.try_refresh(json.dumps(data, indent=2))
+
+    assert outcome.token_account["organizationUuid"] == "acct-personal"
+
+
+def test_a_real_codex_binary_is_never_looked_up_or_spawned():
+    """conftest guard: a test that is not faking codex fails rather than
+    running the real binary (a real `codex login` revokes; the TUI hangs)."""
+    import shutil
+    import subprocess
+
+    with pytest.raises(AssertionError, match="real codex"):
+        shutil.which("codex")
+    with pytest.raises(AssertionError, match="real codex"):
+        subprocess.run(["/usr/local/bin/codex", "login"])
+    with pytest.raises(AssertionError, match="real codex"):
+        subprocess.run("codex logout", shell=True)
+    assert shutil.which("python3") or shutil.which("python")  # others untouched
+
+
+def test_http_errors_from_the_fixtures_are_closed_after_the_test():
+    from tests import codex_fixtures
+
+    err = cf.http_error(401, {"error": "invalid_grant"})
+    assert err in codex_fixtures.OPEN_HTTP_ERRORS  # closed by conftest at teardown

@@ -41,7 +41,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import time
+import time  # noqa: F401 - patch target (tests stub codex_session.time.sleep)
 from pathlib import Path
 from typing import NoReturn
 
@@ -107,27 +107,54 @@ _RECORD_ERRORS = (
 )
 
 
+def in_sessions(path: Path, sessions_dir: Path) -> bool:
+    """Whether ``path`` lies inside the session profiles dir."""
+    return path.resolve().is_relative_to(sessions_dir.resolve())
+
+
+def restore_default_home(sessions_dir: Path) -> tuple[str | None, bool]:
+    """Undo a session's CODEX_HOME in this process. Returns the profile path
+    it pointed at (None when it pointed elsewhere) and whether the default
+    home it was replaced by is known.
+
+    A CODEX_HOME inside a profile means a session's environment (codex's own
+    shell commands inherit it). It is replaced by the default home recorded
+    when that session was launched (DEFAULT_HOME_ENV), or dropped when that
+    default was the implicit ``~/.codex`` (recorded as ``""``). Every Codex
+    command then sees the user's real default login; otherwise the profile's
+    login reads as live, the real default account as inactive, and the
+    consume gate would POST the default login's refresh token (Codex then
+    hits refresh_token_reused).
+
+    A recorded value that is missing (the shell lost it) or itself a profile
+    is not trusted: CODEX_HOME is dropped all the same, but the default home
+    is reported unknown — a custom default may hold another login than
+    ``~/.codex`` — and callers then refresh nothing.
+
+    DEFAULT_HOME_ENV is popped either way: a plain-codex launch must not carry
+    it, and a session launch records the current default afresh.
+    """
+    preset = os.environ.get("CODEX_HOME")
+    recorded = os.environ.pop(DEFAULT_HOME_ENV, None)
+    if not preset or not in_sessions(Path(preset), sessions_dir):
+        return None, True
+    if recorded and not in_sessions(Path(recorded), sessions_dir):
+        os.environ["CODEX_HOME"] = recorded
+        return preset, True
+    del os.environ["CODEX_HOME"]
+    return preset, recorded == ""
+
+
 def read_session_credentials(session_dir: Path) -> str | None:
     """The profile's ``auth.json`` text when it is a JSON object, else None.
 
     Codex rewrites auth.json in place, so a parse failure may be a write in
     flight: retried briefly, like the live store's read.
     """
-    path = session_dir / "auth.json"
-    for attempt in range(codex_store._PARSE_RETRY_ATTEMPTS):
-        try:
-            text = path.read_text(encoding="utf-8")
-        except (FileNotFoundError, NotADirectoryError):
-            return None
-        except UnicodeDecodeError:
-            text = None
-        except OSError:
-            return None
-        if codex_store._json_object(text) is not None:
-            return text
-        if attempt + 1 < codex_store._PARSE_RETRY_ATTEMPTS:
-            time.sleep(codex_store._PARSE_RETRY_DELAY)
-    return None
+    try:
+        return codex_store.read_auth_json(session_dir / "auth.json")
+    except OSError:
+        return None
 
 
 def read_session_identity(session_dir: Path) -> tuple[str, str] | None:
@@ -304,30 +331,50 @@ class CodexSessionManager(SessionManager):
     #
     # `SessionManager.run` drives the launch; these are its provider seams.
 
-    def _normalize_nested_env(self) -> None:
-        """Undo a session's CODEX_HOME when this runs inside one.
+    def run(self, identifier: str, codex_args: list[str], *args, **kwargs) -> NoReturn:
+        self._refuse_revoking_command(codex_args)
+        super().run(identifier, codex_args, *args, **kwargs)
 
-        A CODEX_HOME inside a profile means a session's environment (codex's
-        own shell commands inherit it). It is replaced, for the rest of this
-        process (which execs right after with an environment built from
-        ``os.environ``), by the default home recorded when that session was
-        launched (DEFAULT_HOME_ENV), or dropped when that default was the
-        implicit ``~/.codex``. The live-login read, the consume gate's
-        live-lineage guard, the fast path, sharing and the launch then all see
-        the user's real default home — otherwise the gate would compare a slot
-        against the profile's login (or a stale ``~/.codex``) and could spend
-        the real default login's grant or seed a second copy of it.
+    def exec_default(self, codex_args: list[str]) -> NoReturn:
+        self._refuse_revoking_command(codex_args)
+        super().exec_default(codex_args)
+
+    def _refuse_revoking_command(self, codex_args: list[str]) -> None:
+        """Refuse any forwarded ``login`` or ``logout`` token: ``codex login``
+        and ``codex logout`` revoke the login of the home they run in
+        server-side (codex-spec gotcha 1), and every home a run launches in —
+        a session profile or the default home — holds a stored account's
+        lineage.
+
+        Fails closed rather than modelling codex's option grammar: an
+        option's separate value (``-m o3 logout``) would hide the subcommand
+        from a positional parse. The cost is refusing ``login status``,
+        ``mcp login`` and a prompt that is exactly one of those words.
         """
-        preset = os.environ.get("CODEX_HOME")
-        # Popped either way: a plain-codex fast path must not carry it, and
-        # `_exec_session` records the current default for the next session.
-        recorded = os.environ.pop(DEFAULT_HOME_ENV, "")
-        if not preset or not self._in_profile(Path(preset)):
+        word = next((a for a in codex_args if a in ("login", "logout")), None)
+        if word is None:
             return
-        if recorded and not self._in_profile(Path(recorded)):
-            os.environ["CODEX_HOME"] = recorded
-        else:
-            del os.environ["CODEX_HOME"]
+        prefix = self.switcher.cli_prefix
+        raise SessionError(
+            f"Refusing to pass '{word}' to codex: 'codex login' and 'codex "
+            "logout' revoke a stored account's login server-side. Sign in to an "
+            f"account with '{prefix} add --login [--slot N]'; drop one with "
+            f"'{prefix} remove N'. A prompt that is just the word '{word}' must "
+            "be passed differently, e.g. inside a longer quoted prompt."
+        )
+
+    def _normalize_nested_env(self) -> None:
+        """Undo a session's CODEX_HOME when this runs inside one
+        (:func:`restore_default_home`; the switcher already did it when it
+        was built). The live-login read, the consume gate, the fast path,
+        sharing and the launch then all see the user's real default home.
+        """
+        preset, known = restore_default_home(self.sessions_dir)
+        if not known:
+            self.switcher._distrust_default_home()
+        preset = preset or self.switcher.session_shell_home
+        if not preset:
+            return
         warning(
             f"CODEX_HOME points at a session profile ({preset}); using the "
             f"default Codex home ({codex_store.codex_home()}) for this launch."
@@ -366,7 +413,22 @@ class CodexSessionManager(SessionManager):
         share_history: bool,
     ) -> NoReturn:
         """``codex -c cli_auth_credentials_store="file" <args>`` with
-        ``CODEX_HOME=<profile>``, after recording the run."""
+        ``CODEX_HOME=<profile>``, after recording the run.
+
+        Refused when the profile's config.toml (usually the shared one) has
+        ``forced_*`` settings its login fails: Codex would delete that login
+        at startup (login/src/auth/manager.rs:1315-1440).
+        """
+        creds = read_session_credentials(session_dir)
+        reason = creds and codex_auth.forced_login_violation(
+            creds, codex_store.read_codex_config(session_dir)
+        )
+        if reason:
+            raise SessionError(
+                f"Refusing to launch: {reason}, so Codex would delete this "
+                "session's login at startup. Change the setting in "
+                f"{(session_dir / 'config.toml').resolve()} or pick another account."
+            )
         drop = (*AUTH_OVERRIDE_ENV_VARS, "CODEX_SQLITE_HOME")
         env = {k: v for k, v in os.environ.items() if k not in drop}
         # Kept in the session's env on purpose (a path, nothing secret): it
@@ -386,9 +448,6 @@ class CodexSessionManager(SessionManager):
         self._exec(
             codex_bin, ["-c", codex_store.FILE_STORE_OVERRIDE, *codex_args], env=env
         )
-
-    def _in_profile(self, path: Path) -> bool:
-        return path.resolve().is_relative_to(self.sessions_dir.resolve())
 
     # -- bootstrap -----------------------------------------------------------
 
@@ -410,7 +469,7 @@ class CodexSessionManager(SessionManager):
         creds, unreadable = self.switcher._read_account_credentials_ex(
             account_num, email
         )
-        relogin = f"cswap codex add --login --slot {account_num}"
+        relogin = self.switcher.relogin_hint("", account_num)
         if not creds:
             if unreadable:
                 raise SessionError(
@@ -447,8 +506,8 @@ class CodexSessionManager(SessionManager):
     # -- sharing ---------------------------------------------------------------
 
     def _share_source(self) -> Path:
-        """The Codex home (a nested run has already dropped a CODEX_HOME that
-        pointed into a profile; see ``_fast_path_allowed``)."""
+        """The Codex home (a CODEX_HOME that pointed into a profile has
+        already been undone; see :func:`restore_default_home`)."""
         return codex_store.codex_home()
 
     def _sync_mcp_servers(self, session_dir: Path, share: bool) -> None:

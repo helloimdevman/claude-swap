@@ -769,3 +769,28 @@ def test_codex_menu_bar_messages_name_codex(monkeypatch, tmp_path):
     assert rumps.alert.call_args.kwargs["message"] == (
         "No active Codex login detected. Log in first."
     )
+
+
+def test_the_codex_menu_bar_title_names_codex(monkeypatch, tmp_path):
+    import time
+
+    from claude_swap.codex_switcher import CodexAccountSwitcher
+    from claude_swap.switcher import ClaudeAccountSwitcher
+
+    icon = CodexAccountSwitcher.menubar_icon
+    assert icon.startswith(menubar.ICON) and icon != menubar.ICON
+    assert getattr(ClaudeAccountSwitcher, "menubar_icon", menubar.ICON) == menubar.ICON
+
+    class Codex(_CodexSwitcher):
+        menubar_icon = icon
+
+    _rumps, apps = _fake_rumps(monkeypatch)
+    assert menubar.run(Codex(tmp_path)) == 0
+    app = apps[-1]
+    deadline = time.monotonic() + 2
+    while app._refreshing and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert app.title == icon
+    settings = menubar.MenuBarSettings()
+    assert menubar.format_title("a@x.com", None, settings, icon=icon) == f"{icon} a"
+    assert menubar.format_title("a@x.com", None, settings) == f"{menubar.ICON} a"

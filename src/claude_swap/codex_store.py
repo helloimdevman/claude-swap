@@ -79,15 +79,16 @@ def live_auth_path() -> Path:
     return codex_home() / "auth.json"
 
 
-def read_codex_config() -> dict:
-    """Parsed ``codex_home()/config.toml``, or ``{}`` when absent.
+def read_codex_config(home: Path | None = None) -> dict:
+    """Parsed ``config.toml`` of ``home`` (default :func:`codex_home`), or
+    ``{}`` when absent.
 
     An unparseable file (bad TOML, not UTF-8, unreadable) is logged and
     treated as ``{}`` — so the store mode falls back to ``"file"`` — rather
     than failing every read: Codex itself refuses to start on it, so there is
     no live keyring login to miss.
     """
-    path = codex_home() / "config.toml"
+    path = (home or codex_home()) / "config.toml"
     try:
         with path.open("rb") as f:
             return tomllib.load(f)
@@ -134,6 +135,26 @@ def _json_object(text: str | None) -> dict | None:
     except ValueError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def read_auth_json(path: Path) -> str | None:
+    """An auth.json's text when it is a JSON object, else None (garbage, not
+    UTF-8, or still torn after the retry). Read as bytes: ``read_text`` would
+    translate newlines and break a byte-exact rollback.
+
+    Raises:
+        OSError: The file cannot be read (``FileNotFoundError`` when absent).
+    """
+    for attempt in range(_PARSE_RETRY_ATTEMPTS):
+        try:
+            text = path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            text = None
+        if _json_object(text) is not None:
+            return text
+        if attempt + 1 < _PARSE_RETRY_ATTEMPTS:
+            time.sleep(_PARSE_RETRY_DELAY)
+    return None
 
 
 class CodexCredentialStore(CredentialStore):
@@ -269,26 +290,18 @@ class CodexCredentialStore(CredentialStore):
         the byte-exact rollback.
         """
         path = live_auth_path()
-        for attempt in range(_PARSE_RETRY_ATTEMPTS):
-            try:
-                raw = path.read_bytes()
-            except (FileNotFoundError, NotADirectoryError):
-                return ""
-            except OSError as e:
-                self._host._logger.error(f"Failed to read Codex auth file {path}: {e}")
-                return None
-            try:
-                text = raw.decode("utf-8")
-            except UnicodeDecodeError:
-                text = None
-            if _json_object(text) is not None:
-                return text
-            if attempt + 1 < _PARSE_RETRY_ATTEMPTS:
-                time.sleep(_PARSE_RETRY_DELAY)
-        # Garbage must not travel on as the live credential: a switch would
-        # back it up over the departing slot's good backup.
-        self._host._logger.warning(f"Codex auth file {path} is not a JSON object")
-        return None
+        try:
+            text = read_auth_json(path)
+        except (FileNotFoundError, NotADirectoryError):
+            return ""
+        except OSError as e:
+            self._host._logger.error(f"Failed to read Codex auth file {path}: {e}")
+            return None
+        if text is None:
+            # Garbage must not travel on as the live credential: a switch would
+            # back it up over the departing slot's good backup.
+            self._host._logger.warning(f"Codex auth file {path} is not a JSON object")
+        return text
 
     # -- writes -------------------------------------------------------------------
 
@@ -417,8 +430,7 @@ class CodexCredentialStore(CredentialStore):
             if not tokens:
                 return
             stored = tokens.get("account_id")
-            claims = codex_auth.decode_jwt_payload(tokens.get("id_token"))
-            claimed = codex_auth.auth_claims(claims).get("chatgpt_account_id")
+            claimed = codex_auth.claimed_account_id(tokens.get("id_token"))
         except (ClaudeSwitchError, ValueError, OSError) as e:
             self._host._logger.debug(f"Skipped post-write Codex verification: {e}")
             return

@@ -138,6 +138,13 @@ def auth_claims(claims: dict | None) -> dict:
     return auth if isinstance(auth, dict) else {}
 
 
+def claimed_account_id(id_token: object) -> str | None:
+    """The id_token's ``chatgpt_account_id`` claim: the account its tokens
+    belong to (the stored ``tokens.account_id`` can disagree in a hybrid
+    file; codex-spec gotcha 5)."""
+    return _str(auth_claims(decode_jwt_payload(id_token)).get("chatgpt_account_id"))
+
+
 def identity(creds: str) -> dict | None:
     """``{"email", "uuid", "organizationUuid", "planType"}`` from the
     id_token, fields str-or-None; None for API-key or malformed blobs.
@@ -158,6 +165,55 @@ def identity(creds: str) -> dict | None:
         "organizationUuid": _account_id(tokens, auth),
         "planType": _str(auth.get("chatgpt_plan_type")),
     }
+
+
+def token_identity(creds: str) -> dict | None:
+    """``{"uuid", "email", "organizationUuid"}`` of the account the tokens
+    belong to, for lineage attribution: unlike :func:`identity`, the account
+    comes from the id_token's own claim, so a hybrid (B's account_id over A's
+    tokens) is attributed to A. None for API-key or malformed blobs."""
+    ident = identity(creds)
+    if ident is None:
+        return None
+    claim = claimed_account_id((chatgpt_tokens(creds) or {}).get("id_token"))
+    return {
+        "uuid": ident["uuid"],
+        "email": ident["email"],
+        "organizationUuid": claim or ident["organizationUuid"],
+    }
+
+
+def forced_login_violation(creds: str, config: dict) -> str | None:
+    """Why Codex would log ``creds`` out at startup under ``config``, or None.
+
+    Mirrors ``enforce_login_restrictions`` (login/src/auth/manager.rs:
+    1315-1440), which DELETES a non-matching login: ``forced_login_method``
+    must match the login's kind; ``forced_chatgpt_workspace_id`` (a string or
+    a list, blank entries ignored) binds ChatGPT logins only, compared with the
+    id_token's ``chatgpt_account_id``.
+    """
+    is_api_key = is_api_key_blob(creds)
+    method = config.get("forced_login_method")
+    if method == "api" and not is_api_key:
+        return 'forced_login_method = "api" but this is a ChatGPT login'
+    if method == "chatgpt" and is_api_key:
+        return 'forced_login_method = "chatgpt" but this is an API-key login'
+    allowed = config.get("forced_chatgpt_workspace_id")
+    if isinstance(allowed, str):
+        allowed = [allowed]
+    if not isinstance(allowed, list) or is_api_key:
+        return None
+    allowed = [w.strip() for w in allowed if isinstance(w, str) and w.strip()]
+    if not allowed:
+        return None
+    tokens = chatgpt_tokens(creds) or {}
+    workspace = claimed_account_id(tokens.get("id_token"))
+    if workspace in allowed:
+        return None
+    return (
+        f"forced_chatgpt_workspace_id allows {', '.join(allowed)} but this "
+        f"login belongs to {workspace or 'no workspace'}"
+    )
 
 
 def oauth_view(creds: str) -> dict | None:
@@ -271,8 +327,8 @@ def try_refresh(creds: str, timeout_s: float = 10.0) -> RefreshOutcome:
     # reload compares). A blob lacking it gets it from the id_token claim,
     # as Codex's login does: Codex's guarded refresh fails without one.
     if not _str(tokens.get("account_id")):
-        claim = auth_claims(decode_jwt_payload(tokens.get("id_token"))).get("chatgpt_account_id")
-        if _str(claim):
+        claim = claimed_account_id(tokens.get("id_token"))
+        if claim:
             tokens["account_id"] = claim
     data["last_refresh"] = now_rfc3339()
     # Keep the input's style: pretty as Codex's file store writes it,
@@ -282,12 +338,8 @@ def try_refresh(creds: str, timeout_s: float = 10.0) -> RefreshOutcome:
     else:
         new_creds = json.dumps(data, separators=(",", ":"))
 
-    ident = identity(new_creds)
-    token_account = (
-        {k: ident[k] for k in ("uuid", "email", "organizationUuid")}
-        if ident and ident["uuid"]
-        else None
-    )
+    ident = token_identity(new_creds)
+    token_account = ident if ident and ident["uuid"] else None
     return RefreshOutcome(new_creds, None, token_account)
 
 

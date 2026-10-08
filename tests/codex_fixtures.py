@@ -164,8 +164,15 @@ class FakeResponse:
         return False
 
 
+# Every HTTPError ``http_error`` made, closed by conftest after each test:
+# each wraps an open response, which the GC would report as a ResourceWarning.
+OPEN_HTTP_ERRORS: list[urllib.error.HTTPError] = []
+
+
 def http_error(
     code: int, body: dict | bytes = b"", headers: dict | None = None, url: str = "https://x"
 ) -> urllib.error.HTTPError:
     raw = body if isinstance(body, bytes) else json.dumps(body).encode()
-    return urllib.error.HTTPError(url, code, "err", hdrs=headers, fp=io.BytesIO(raw))
+    err = urllib.error.HTTPError(url, code, "err", hdrs=headers, fp=io.BytesIO(raw))
+    OPEN_HTTP_ERRORS.append(err)
+    return err

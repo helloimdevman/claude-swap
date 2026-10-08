@@ -822,3 +822,94 @@ class TestConsumeGate:
 
         assert outcome.error == "transient"
         refresh.assert_not_called()
+
+
+class TestHybridLogin:
+    """codex-spec gotcha 5: a swap racing a refresh leaves B's
+    ``tokens.account_id`` over A's tokens. The lineage oracle follows the
+    tokens (the id_token's own claim), not the stored account_id."""
+
+    @staticmethod
+    def _hybrid(**tokens_of) -> str:
+        data = cf.auth_dict(**tokens_of, refresh_token="rt-personal-rotated")
+        data["tokens"]["account_id"] = "acct-team"
+        return json.dumps(data, indent=2)
+
+    def test_the_oracle_names_the_tokens_owner(self, codex_home: Path):
+        hybrid = self._hybrid(**PERSONAL)
+        assert _switcher()._resolve_token_identity(hybrid) == {
+            "uuid": "user-1", "email": "user@example.com", "organizationUuid": "acct-personal",
+        }
+
+    def test_a_hybrid_never_resyncs_into_the_stored_account_ids_slot(self, codex_home: Path):
+        s = _switcher()
+        _add(s, codex_home, **PERSONAL)
+        team = _add(s, codex_home, **TEAM)
+        hybrid = self._hybrid(**PERSONAL)
+        (codex_home / "auth.json").write_text(hybrid, encoding="utf-8")
+
+        s._resync_rotated_backup("2", "user@example.com", "acct-team", hybrid)
+
+        assert s._read_account_credentials("2", "user@example.com") == team
+
+
+class TestWorkspaceNameRoster:
+    @posix_only
+    def test_a_roster_lock_timeout_keeps_the_completed_login(
+        self, codex_home: Path, fake_codex: SimpleNamespace, monkeypatch, caplog
+    ):
+        from claude_swap.exceptions import LockError
+
+        fake_codex.auth = cf.auth_json(**TEAM)
+        monkeypatch.setattr(codex_auth, "fetch_workspace_name", lambda c, base_url=None: "Acme Corp")
+
+        class Busy:
+            def __init__(self, path):
+                pass
+
+            def __enter__(self):
+                raise LockError("Failed to acquire lock - another instance may be running")
+
+            def __exit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(codex_switcher, "FileLock", Busy)
+        s = _switcher()
+        _add(s, codex_home, **PERSONAL)
+
+        with caplog.at_level(logging.WARNING, logger="claude-swap"):
+            s.add_account_via_login()
+
+        rec = _roster(s)["accounts"]["2"]
+        assert (rec["organizationUuid"], rec["organizationName"]) == ("acct-team", "Acme Corp")
+        assert s._read_account_credentials("2", "user@example.com") == fake_codex.auth
+        assert any("workspace name" in r.getMessage() for r in caplog.records)
+
+
+class TestSwitchTargetValidity:
+    @pytest.mark.parametrize("drop", ["last_refresh", "account_id"])
+    def test_a_stored_login_codex_could_not_use_is_refused(
+        self, codex_home: Path, drop: str
+    ):
+        s = _switcher()
+        _add(s, codex_home, **OTHER)
+        live = _add(s, codex_home, **PERSONAL)
+        broken = cf.auth_dict(**OTHER)
+        if drop == "last_refresh":
+            del broken["last_refresh"]
+        else:
+            del broken["tokens"]["account_id"]
+        s._write_account_credentials("1", "other@example.com", json.dumps(broken, indent=2))
+
+        with pytest.raises(SwitchError, match=f"no {'tokens.' if drop == 'account_id' else ''}{drop}.*cswap codex add --login --slot 1"):
+            s.switch_to("1")
+
+        assert _live(codex_home) == live
+        assert _roster(s)["activeAccountNumber"] == 2
+
+    def test_api_key_targets_are_not_held_to_the_chatgpt_rules(self, codex_home: Path):
+        s = _switcher()
+        _add(s, codex_home, **PERSONAL)
+        s.add_account_from_token("sk-proj-test", email="key@example.com")
+        s.switch_to("2")
+        assert codex_auth.is_api_key_blob(_live(codex_home))
