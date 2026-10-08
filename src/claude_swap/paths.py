@@ -37,6 +37,7 @@ LEGACY_BACKUP_DIRNAME = ".claude-swap-backup"
 CODEX_SUBDIR = "codex"
 CODEX_DISPLAY_NAME = "Codex"
 CODEX_CLI_PREFIX = "cswap codex"
+CODEX_TOKEN_KIND = "OpenAI API key"
 
 
 def get_claude_config_home() -> Path:

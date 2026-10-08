@@ -51,7 +51,12 @@ from claude_swap.json_output import (
 )
 from claude_swap.locking import FileLock
 from claude_swap.models import get_timestamp
-from claude_swap.paths import CODEX_CLI_PREFIX, CODEX_DISPLAY_NAME, CODEX_SUBDIR
+from claude_swap.paths import (
+    CODEX_CLI_PREFIX,
+    CODEX_DISPLAY_NAME,
+    CODEX_SUBDIR,
+    CODEX_TOKEN_KIND,
+)
 from claude_swap.printer import bolded, dimmed, warning
 from claude_swap.switcher import ERROR_NOTES, SENTINEL_NOTES, ClaudeAccountSwitcher
 from claude_swap.usage_store import FetchRecord
@@ -121,7 +126,17 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
 
     provider_name = "codex"
     display_name = CODEX_DISPLAY_NAME
+    short_name = CODEX_DISPLAY_NAME
     cli_prefix = CODEX_CLI_PREFIX
+    # `codex login --with-api-key`'s auth.json, carried as one string.
+    api_key_format = "Codex API-key auth.json string"
+    token_kind = CODEX_TOKEN_KIND
+    switch_notice = (
+        "Codex processes already running keep the previous account — "
+        "restart them to apply it."
+    )
+    # Identity lives in the login itself (there is no config file).
+    live_config_missing = "No live Codex login found"
     backup_subdir = CODEX_SUBDIR
     backup_keychain_service = "claude-swap-codex"
     run_legacy_migrations = False
@@ -193,6 +208,15 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
             "on the wrong live store — unset CODEX_HOME or run from a normal "
             "shell."
         )
+
+    def relogin_hint(
+        self, text: str, slot: object = None, via_login: str = "{cmd}"
+    ) -> str:
+        """Always ``cswap codex add --login``: a ``codex login`` in the live
+        home would revoke the stored account it replaces (codex-spec gotcha
+        1), so a Codex hint never says "log in, then add"."""
+        cmd = f"{self.cli_prefix} add --login"
+        return via_login.format(cmd=cmd if slot is None else f"{cmd} --slot {slot}")
 
     def _delete_session_keychain_entry(self, session_dir: Path) -> None:
         """Nothing to delete: a Codex session profile keeps its login in its
@@ -524,7 +548,7 @@ class CodexAccountSwitcher(ClaudeAccountSwitcher):
         if token == "-":
             token = sys.stdin.readline().rstrip("\n")
         elif not token:
-            token = getpass.getpass("OpenAI API key: ")
+            token = getpass.getpass(f"{self.token_kind}: ")
         token = token.strip()
         if not token:
             raise ValidationError("API key cannot be empty")

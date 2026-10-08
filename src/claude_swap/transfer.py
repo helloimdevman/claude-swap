@@ -267,7 +267,7 @@ def export_accounts(
                 )
             config_text = switcher._snapshot_live_config()
             if config_text is None:
-                raise ConfigError("Claude config file not found")
+                raise ConfigError(switcher.live_config_missing)
         else:
             creds_text = switcher._read_account_credentials(num, email)
             config_text = switcher._read_account_config(num, email)
@@ -283,7 +283,7 @@ def export_accounts(
                 _eprint(
                     f"Skipping Account-{num} ({email}): no stored "
                     f"credentials/config — re-add with: "
-                    f"{switcher.cli_prefix} --add-account --slot {num}"
+                    + switcher.relogin_hint(f"cswap --add-account --slot {num}", num)
                 )
                 continue
 
@@ -320,8 +320,8 @@ def export_accounts(
     if not accounts_payload:
         raise TransferError(
             "no exportable accounts — all managed slots are missing stored "
-            f"credentials/config. Re-add with: {switcher.cli_prefix} --add-account "
-            "--slot <number>"
+            "credentials/config. Re-add with: "
+            + switcher.relogin_hint("cswap --add-account --slot <number>", "<number>")
         )
 
     # Only carry activeAccountNumber if that slot is actually present in the
@@ -436,7 +436,8 @@ def import_accounts(
         if is_api_key:
             if not (isinstance(creds_obj, str) and switcher._looks_like_api_key(creds_obj)):
                 raise TransferError(
-                    f"API-key credentials for {email} must be a raw sk-ant-api… string"
+                    f"API-key credentials for {email} must be a "
+                    f"{switcher.api_key_format}"
                 )
             creds_text = creds_obj.strip()
         else:
@@ -572,7 +573,7 @@ def import_accounts(
                     f"Warning: {entry['email']} (slot {target_num}) has a live "
                     f"session-mode instance (PID {', '.join(map(str, live_pids))}); "
                     "its session profile keeps the pre-import credentials until "
-                    "it is restarted via 'cswap run'."
+                    f"it is restarted via '{switcher.cli_prefix} run'."
                 )
         else:
             if entry["exported_num"] not in data.get("accounts", {}):

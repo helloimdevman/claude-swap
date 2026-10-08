@@ -805,8 +805,12 @@ class SessionManager:
                     f"neither be stored nor stashed, so the backup holds a "
                     f"spent grant and the successor is gone. Fix the storage "
                     f"failure first; retrying before that spends nothing but "
-                    f"earns a strike. If the slot strikes, log in again and "
-                    f"re-add it: cswap --add-account --slot {account_num}"
+                    f"earns a strike. If the slot strikes, "
+                    + self.switcher.relogin_hint(
+                        "log in again and re-add it: "
+                        f"cswap --add-account --slot {account_num}",
+                        account_num, "re-add it: {cmd}",
+                    )
                 )
             if outcome.error is not None:
                 warning(
@@ -879,8 +883,12 @@ class SessionManager:
                 self._cleanup_failed_session(session_dir)
                 raise SessionError(
                     f"Session profile for Account-{account_num} ({email}) failed "
-                    f"validation. Log in with that account and re-add it: "
-                    f"cswap --add-account --slot {account_num}"
+                    f"validation. "
+                    + self.switcher.relogin_hint(
+                        "Log in with that account and re-add it: "
+                        f"cswap --add-account --slot {account_num}",
+                        account_num, "Re-add it: {cmd}",
+                    )
                 )
         # Lock released here, before any exec.
 
